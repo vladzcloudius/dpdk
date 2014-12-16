@@ -3327,6 +3327,39 @@ ixgbe_alloc_rx_queue_mbufs(struct igb_rx_queue *rxq)
 }
 
 static int
+ixgbe_config_vf_rss(struct rte_eth_dev *dev)
+{
+	struct ixgbe_hw *hw;
+	uint32_t mrqc;
+
+	ixgbe_rss_configure(dev);
+
+	hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
+
+	/* MRQC: enable VF RSS */
+	mrqc = IXGBE_READ_REG(hw, IXGBE_MRQC);
+	mrqc &= ~IXGBE_MRQC_MRQE_MASK;
+	switch (RTE_ETH_DEV_SRIOV(dev).active) {
+	case ETH_64_POOLS:
+		mrqc |= IXGBE_MRQC_VMDQRSS64EN;
+		break;
+
+	case ETH_32_POOLS:
+	case ETH_16_POOLS:
+		mrqc |= IXGBE_MRQC_VMDQRSS32EN;
+		break;
+
+	default:
+		PMD_INIT_LOG(ERR, "Invalid pool number in IOV mode");
+		return -EINVAL;
+	}
+
+	IXGBE_WRITE_REG(hw, IXGBE_MRQC, mrqc);
+
+	return 0;
+}
+
+static int
 ixgbe_dev_mq_rx_configure(struct rte_eth_dev *dev)
 {
 	struct ixgbe_hw *hw =
@@ -3358,24 +3391,34 @@ ixgbe_dev_mq_rx_configure(struct rte_eth_dev *dev)
 			default: ixgbe_rss_disable(dev);
 		}
 	} else {
-		switch (RTE_ETH_DEV_SRIOV(dev).active) {
 		/*
 		 * SRIOV active scheme
 		 * FIXME if support DCB/RSS together with VMDq & SRIOV
 		 */
-		case ETH_64_POOLS:
-			IXGBE_WRITE_REG(hw, IXGBE_MRQC, IXGBE_MRQC_VMDQEN);
+		switch (dev->data->dev_conf.rxmode.mq_mode) {
+		case ETH_MQ_RX_RSS:
+		case ETH_MQ_RX_VMDQ_RSS:
+			ixgbe_config_vf_rss(dev);
 			break;
 
-		case ETH_32_POOLS:
-			IXGBE_WRITE_REG(hw, IXGBE_MRQC, IXGBE_MRQC_VMDQRT4TCEN);
-			break;
-
-		case ETH_16_POOLS:
-			IXGBE_WRITE_REG(hw, IXGBE_MRQC, IXGBE_MRQC_VMDQRT8TCEN);
-			break;
 		default:
-			PMD_INIT_LOG(ERR, "invalid pool number in IOV mode");
+			switch (RTE_ETH_DEV_SRIOV(dev).active) {
+			case ETH_64_POOLS:
+				IXGBE_WRITE_REG(hw, IXGBE_MRQC, IXGBE_MRQC_VMDQEN);
+				break;
+
+			case ETH_32_POOLS:
+				IXGBE_WRITE_REG(hw, IXGBE_MRQC, IXGBE_MRQC_VMDQRT4TCEN);
+				break;
+
+			case ETH_16_POOLS:
+				IXGBE_WRITE_REG(hw, IXGBE_MRQC, IXGBE_MRQC_VMDQRT8TCEN);
+				break;
+			default:
+				PMD_INIT_LOG(ERR, "invalid pool number in IOV mode");
+				break;
+			}
+			break;
 		}
 	}
 
@@ -4094,6 +4137,9 @@ ixgbevf_dev_rx_init(struct rte_eth_dev *dev)
 			IXGBE_PSRTYPE_IPV6HDR;
 #endif
 
+	/* Set RQPL for VF RSS according to max Rx queue */
+	psrtype |= (hw->mac.max_rx_queues >> 1) <<
+			IXGBE_PSRTYPE_RQPL_SHIFT;
 	IXGBE_WRITE_REG(hw, IXGBE_VFPSRTYPE, psrtype);
 
 	if (dev->data->dev_conf.rxmode.enable_scatter) {
