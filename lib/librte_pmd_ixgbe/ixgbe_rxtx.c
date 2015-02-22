@@ -1022,18 +1022,17 @@ ixgbe_rx_scan_hw_ring(struct igb_rx_queue *rxq)
 }
 
 static inline int
-ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
+ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq, bool reset_mbuf)
 {
 	volatile union ixgbe_adv_rx_desc *rxdp;
 	struct igb_rx_entry *rxep;
 	struct rte_mbuf *mb;
 	uint16_t alloc_idx;
-	uint64_t dma_addr;
+	__le64 dma_addr;
 	int diag, i;
 
 	/* allocate buffers in bulk directly into the S/W ring */
-	alloc_idx = (uint16_t)(rxq->rx_free_trigger -
-				(rxq->rx_free_thresh - 1));
+	alloc_idx = rxq->rx_free_trigger - (rxq->rx_free_thresh - 1);
 	rxep = &rxq->sw_ring[alloc_idx];
 	diag = rte_mempool_get_bulk(rxq->mb_pool, (void *)rxep,
 				    rxq->rx_free_thresh);
@@ -1044,27 +1043,25 @@ ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
 	for (i = 0; i < rxq->rx_free_thresh; ++i) {
 		/* populate the static rte mbuf fields */
 		mb = rxep[i].mbuf;
-		rte_mbuf_refcnt_set(mb, 1);
-		mb->next = NULL;
+		if (reset_mbuf) {
+			rte_mbuf_refcnt_set(mb, 1);
+			mb->next = NULL;
+			mb->nb_segs = 1;
+			mb->port = rxq->port_id;
+		}
+
 		mb->data_off = RTE_PKTMBUF_HEADROOM;
-		mb->nb_segs = 1;
-		mb->port = rxq->port_id;
 
 		/* populate the descriptors */
-		dma_addr = (uint64_t)mb->buf_physaddr + RTE_PKTMBUF_HEADROOM;
+		dma_addr = rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(mb));
 		rxdp[i].read.hdr_addr = dma_addr;
 		rxdp[i].read.pkt_addr = dma_addr;
 	}
 
-	/* update tail pointer */
-	rte_wmb();
-	IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, rxq->rx_free_trigger);
-
 	/* update state of internal queue structure */
-	rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_trigger +
-						rxq->rx_free_thresh);
+	rxq->rx_free_trigger = rxq->rx_free_trigger + rxq->rx_free_thresh;
 	if (rxq->rx_free_trigger >= rxq->nb_rx_desc)
-		rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_thresh - 1);
+		rxq->rx_free_trigger = rxq->rx_free_thresh - 1;
 
 	/* no errors */
 	return 0;
@@ -1112,7 +1109,9 @@ rx_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 	/* if required, allocate new buffers to replenish descriptors */
 	if (rxq->rx_tail > rxq->rx_free_trigger) {
-		if (ixgbe_rx_alloc_bufs(rxq) != 0) {
+		uint16_t cur_free_trigger = rxq->rx_free_trigger;
+
+		if (ixgbe_rx_alloc_bufs(rxq, true) != 0) {
 			int i, j;
 			PMD_RX_LOG(DEBUG, "RX mbuf alloc failed port_id=%u "
 				   "queue_id=%u", (unsigned) rxq->port_id,
@@ -1132,6 +1131,10 @@ rx_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 			return 0;
 		}
+
+		/* update tail pointer */
+		rte_wmb();
+		IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, cur_free_trigger);
 	}
 
 	if (rxq->rx_tail >= rxq->nb_rx_desc)
@@ -1170,6 +1173,13 @@ ixgbe_recv_pkts_bulk_alloc(void *rx_queue, struct rte_mbuf **rx_pkts,
 	}
 
 	return nb_rx;
+}
+#else
+static inline int
+ixgbe_rx_alloc_bufs(__rte_unused struct igb_rx_queue *rxq,
+		    __rte_unused bool reset_mbuf)
+{
+	return -ENOMEM;
 }
 #endif /* RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC */
 
@@ -1355,6 +1365,343 @@ ixgbe_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	return (nb_rx);
 }
 
+/**
+ * Detect an RSC descriptor.
+ */
+static inline uint32_t ixgbe_rsc_count(union ixgbe_adv_rx_desc *rx)
+{
+	return (rte_le_to_cpu_32(rx->wb.lower.lo_dword.data) &
+		IXGBE_RXDADV_RSCCNT_MASK) >> IXGBE_RXDADV_RSCCNT_SHIFT;
+}
+
+/**
+ * Initialize the first mbuf of the returned packet:
+ *    - RX port identifier,
+ *    - hardware offload data, if any:
+ *      - RSS flag & hash,
+ *      - IP checksum flag,
+ *      - VLAN TCI, if any,
+ *      - error flags.
+ * @head HEAD of the packet cluster
+ * @desc HW descriptor to get data from
+ * @port_id Port ID of the Rx queue
+ */
+static inline void ixgbe_fill_cluster_head_buf(
+	struct rte_mbuf *head,
+	union ixgbe_adv_rx_desc *desc,
+	uint8_t port_id,
+	uint32_t staterr)
+{
+	uint32_t hlen_type_rss;
+	uint64_t pkt_flags;
+
+	head->port = port_id;
+
+	/*
+	 * The vlan_tci field is only valid when PKT_RX_VLAN_PKT is
+	 * set in the pkt_flags field.
+	 */
+	head->vlan_tci = rte_le_to_cpu_16(desc->wb.upper.vlan);
+	hlen_type_rss = rte_le_to_cpu_32(desc->wb.lower.lo_dword.data);
+	pkt_flags = rx_desc_hlen_type_rss_to_pkt_flags(hlen_type_rss);
+	pkt_flags |= rx_desc_status_to_pkt_flags(staterr);
+	pkt_flags |= rx_desc_error_to_pkt_flags(staterr);
+	head->ol_flags = pkt_flags;
+
+	if (likely(pkt_flags & PKT_RX_RSS_HASH))
+		head->hash.rss = rte_le_to_cpu_32(desc->wb.lower.hi_dword.rss);
+	else if (pkt_flags & PKT_RX_FDIR) {
+		head->hash.fdir.hash =
+			rte_le_to_cpu_16(desc->wb.lower.hi_dword.csum_ip.csum)
+							  & IXGBE_ATR_HASH_MASK;
+		head->hash.fdir.id =
+			rte_le_to_cpu_16(desc->wb.lower.hi_dword.csum_ip.ip_id);
+	}
+}
+
+/**
+ * Bulk receive handler for and LRO case.
+ *
+ * @rx_queue Rx queue handle
+ * @rx_pkts table of recieved packets
+ * @nb_pkts size of rx_pkts table
+ * @bulk_alloc if TRUE bulk allocation is used for a HW ring refilling
+ *
+ * Handles the Rx HW ring completions when RSC feature is configured. Uses an
+ * additional ring of igb_rsc_entry's that will hold the relevant RSC info.
+ *
+ * We use the same logic as in Lunux and in FreeBSD ixgbe drivers:
+ * 1) When non-EOP RSC completion arrives:
+ *    a) Update the HEAD of the current RSC aggregation cluster with the new
+ *       segment's data length.
+ *    b) Set the "next" pointer of the current segment to point to the segment
+ *       at the NEXTP index.
+ *    c) Pass the HEAD of RSC aggregation cluster on to the next NEXTP entry
+ *       in the sw_rsc_ring.
+ * 2) When EOP arrives we just update the cluster's total length and offload
+ *    flags and deliver the cluster up to the upper layers. In our case - put it
+ *    in the rx_pkts table.
+ *
+ * Returns the number of received packets/clusters (according to the "bulk
+ * receive" interface).
+ */
+static inline uint16_t
+_recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
+	       bool bulk_alloc)
+{
+	struct igb_rx_queue *rxq = rx_queue;
+	volatile union ixgbe_adv_rx_desc *rx_ring = rxq->rx_ring;
+	struct igb_rx_entry *sw_ring = rxq->sw_ring;
+	struct igb_rsc_entry *sw_rsc_ring = rxq->sw_rsc_ring;
+	uint16_t rx_id = rxq->rx_tail;
+	uint16_t nb_rx = 0;
+	uint16_t nb_hold = rxq->nb_rx_hold;
+	uint16_t prev_id = rxq->rx_tail;
+
+	while (nb_rx < nb_pkts) {
+		bool eop;
+		struct igb_rx_entry *rxe;
+		struct igb_rsc_entry *rsc_entry;
+		struct igb_rsc_entry *next_rsc_entry;
+		struct igb_rx_entry *next_rxe;
+		struct rte_mbuf *first_seg;
+		struct rte_mbuf *rxm;
+		struct rte_mbuf *nmb;
+		union ixgbe_adv_rx_desc rxd;
+		uint16_t data_len;
+		uint16_t next_id;
+		volatile union ixgbe_adv_rx_desc *rxdp;
+		uint32_t staterr;
+
+	next_desc:
+		/*
+		 * The code in this whole file uses the volatile pointer to
+		 * ensure the read ordering (on the compiler level only!!!) of
+		 * the status and the rest of the descriptor fields! This is
+		 * so UGLY - why not to just use the compiler barrier instead?
+		 * DPDK even has the rte_compiler_barrier() for that.
+		 *
+		 * But most importantly this is just wrong because this doesn't
+		 * ensure memory ordering in a general case at all. For
+		 * instance, DPDK is supposed to work on Power CPUs when
+		 * compiler barrier may not be enough!
+		 *
+		 * I tried to write only this function right for a starters as a
+		 * part of an LRO/RSC patch but the compiler cursed at me when I
+		 * tried to cast away the "volatile" from rx_ring (yes, it's
+		 * volatile too!!!). So, I'm keeping it the way it is now.
+		 *
+		 * The code in this file is broken in so many other places and
+		 * will just not work on a big endian CPU anyway therefore the
+		 * lines below will have to be revisited anyway together with
+		 * the rest of the ixgbe PMD.
+		 *
+		 * TODO:
+		 *    - Get rid of volatile crap and let the compiler to its
+		 *      job.
+		 *    - Use the proper memory barrier (rte_rmb()) to ensure the
+		 *      memory ordering below.
+		 */
+		rxdp = &rx_ring[rx_id];
+		staterr = rte_le_to_cpu_32(rxdp->wb.upper.status_error);
+
+		if (!(staterr & IXGBE_RXDADV_STAT_DD))
+			break;
+
+		rxd = *rxdp;
+
+		PMD_RX_LOG(DEBUG, "port_id=%u queue_id=%u rx_id=%u "
+				  "staterr=0x%x data_len=%u",
+			   rxq->port_id, rxq->queue_id, rx_id, staterr,
+			   rte_le_to_cpu_16(rxd.wb.upper.length));
+
+		if (!bulk_alloc) {
+			nmb = rte_rxmbuf_alloc(rxq->mb_pool);
+			if (nmb == NULL) {
+				PMD_RX_LOG(DEBUG, "RX mbuf alloc failed "
+						  "port_id=%u queue_id=%u",
+					   rxq->port_id, rxq->queue_id);
+
+				rte_eth_devices[rxq->port_id].data->
+							rx_mbuf_alloc_failed++;
+				break;
+			}
+		} else if (nb_hold > rxq->rx_free_thresh) {
+			uint16_t next_rdt = rxq->rx_free_trigger;
+			if (!ixgbe_rx_alloc_bufs(rxq, false)) {
+				rte_wmb();
+				IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr,
+						    next_rdt);
+				nb_hold -= rxq->rx_free_thresh;
+			} else {
+				PMD_RX_LOG(DEBUG, "RX bulk alloc failed "
+						  "port_id=%u queue_id=%u",
+					   rxq->port_id, rxq->queue_id);
+
+				rte_eth_devices[rxq->port_id].data->
+							rx_mbuf_alloc_failed++;
+				break;
+			}
+		}
+
+		nb_hold++;
+		rxe = &sw_ring[rx_id];
+		eop = staterr & IXGBE_RXDADV_STAT_EOP;
+
+		next_id = rx_id + 1;
+		if (next_id == rxq->nb_rx_desc)
+			next_id = 0;
+
+		/* Prefetch next mbuf while processing current one. */
+		rte_ixgbe_prefetch(sw_ring[next_id].mbuf);
+
+		/*
+		 * When next RX descriptor is on a cache-line boundary,
+		 * prefetch the next 4 RX descriptors and the next 4 pointers
+		 * to mbufs.
+		 */
+		if ((next_id & 0x3) == 0) {
+			rte_ixgbe_prefetch(&rx_ring[next_id]);
+			rte_ixgbe_prefetch(&sw_ring[next_id]);
+		}
+
+		rxm = rxe->mbuf;
+
+		if (!bulk_alloc) {
+			__le64 dma =
+			  rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(nmb));
+			/*
+			 * Update RX descriptor with the physical address of the
+			 * new data buffer of the new allocated mbuf.
+			 */
+			rxe->mbuf = nmb;
+
+                        rxm->data_off = RTE_PKTMBUF_HEADROOM;
+			rxdp->read.hdr_addr = dma;
+			rxdp->read.pkt_addr = dma;
+		}
+		/*
+		 * Set data length & data buffer address of mbuf.
+		 */
+		data_len = rte_le_to_cpu_16(rxd.wb.upper.length);
+		rxm->data_len = data_len;
+
+		if (!eop) {
+			uint16_t nextp_id;
+			/*
+			 * Get next descriptor index:
+			 *  - For RSC it's in the NEXTP field.
+			 *  - For a scattered packet - it's just a following
+			 *    descriptor.
+			 */
+			if (ixgbe_rsc_count(&rxd))
+				nextp_id =
+					(staterr & IXGBE_RXDADV_NEXTP_MASK) >>
+						       IXGBE_RXDADV_NEXTP_SHIFT;
+			else
+				nextp_id = next_id;
+
+			next_rsc_entry = &sw_rsc_ring[nextp_id];
+			next_rxe = &sw_ring[nextp_id];
+			rte_ixgbe_prefetch(next_rxe);
+		}
+
+		rsc_entry = &sw_rsc_ring[rx_id];
+		first_seg = rsc_entry->fbuf;
+		rsc_entry->fbuf = NULL;
+
+		/*
+		 * If this is the first buffer of the received packet,
+		 * set the pointer to the first mbuf of the packet and
+		 * initialize its context.
+		 * Otherwise, update the total length and the number of segments
+		 * of the current scattered packet, and update the pointer to
+		 * the last mbuf of the current packet.
+		 */
+		if (first_seg == NULL) {
+			first_seg = rxm;
+			first_seg->pkt_len = data_len;
+			first_seg->nb_segs = 1;
+		} else {
+			first_seg->pkt_len += data_len;
+			first_seg->nb_segs++;
+		}
+
+		prev_id = rx_id;
+		rx_id = next_id;
+
+		/*
+		 * If this is not the last buffer of the received packet, update
+		 * the pointer to the first mbuf at the NEXTP entry in the
+		 * sw_rsc_ring and continue to parse the RX ring.
+		 */
+		if (!eop) {
+			rxm->next = next_rxe->mbuf;
+			next_rsc_entry->fbuf = first_seg;
+			goto next_desc;
+		}
+
+		/*
+		 * This is the last buffer of the received packet - return
+		 * the current cluster to the user.
+		 */
+		rxm->next = NULL;
+
+		/* Initialize the first mbuf of the returned packet */
+		ixgbe_fill_cluster_head_buf(first_seg, &rxd, rxq->port_id,
+					    staterr);
+
+		/* Prefetch data of first segment, if configured to do so. */
+		rte_packet_prefetch((char *)first_seg->buf_addr +
+			first_seg->data_off);
+
+		/*
+		 * Store the mbuf address into the next entry of the array
+		 * of returned packets.
+		 */
+		rx_pkts[nb_rx++] = first_seg;
+	}
+
+	/*
+	 * Record index of the next RX descriptor to probe.
+	 */
+	rxq->rx_tail = rx_id;
+
+	/*
+	 * If the number of free RX descriptors is greater than the RX free
+	 * threshold of the queue, advance the Receive Descriptor Tail (RDT)
+	 * register.
+	 * Update the RDT with the value of the last processed RX descriptor
+	 * minus 1, to guarantee that the RDT register is never equal to the
+	 * RDH register, which creates a "full" ring situtation from the
+	 * hardware point of view...
+	 */
+	if (!bulk_alloc && nb_hold > rxq->rx_free_thresh) {
+		PMD_RX_LOG(DEBUG, "port_id=%u queue_id=%u rx_tail=%u "
+			   "nb_hold=%u nb_rx=%u",
+			   rxq->port_id, rxq->queue_id, rx_id, nb_hold, nb_rx);
+
+		IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
+		nb_hold = 0;
+	}
+
+	rxq->nb_rx_hold = nb_hold;
+	return nb_rx;
+}
+
+uint16_t
+ixgbe_recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts)
+{
+	return _recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, false);
+}
+
+uint16_t
+ixgbe_recv_pkts_lro_bulk_alloc(void *rx_queue, struct rte_mbuf **rx_pkts,
+			       uint16_t nb_pkts)
+{
+	return _recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, true);
+}
+
 uint16_t
 ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			  uint16_t nb_pkts)
@@ -1371,12 +1718,10 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	union ixgbe_adv_rx_desc rxd;
 	uint64_t dma; /* Physical address of mbuf data buffer */
 	uint32_t staterr;
-	uint32_t hlen_type_rss;
 	uint16_t rx_id;
 	uint16_t nb_rx;
 	uint16_t nb_hold;
 	uint16_t data_len;
-	uint64_t pkt_flags;
 
 	nb_rx = 0;
 	nb_hold = 0;
@@ -1534,39 +1879,9 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 					(uint16_t) (data_len - ETHER_CRC_LEN);
 		}
 
-		/*
-		 * Initialize the first mbuf of the returned packet:
-		 *    - RX port identifier,
-		 *    - hardware offload data, if any:
-		 *      - RSS flag & hash,
-		 *      - IP checksum flag,
-		 *      - VLAN TCI, if any,
-		 *      - error flags.
-		 */
-		first_seg->port = rxq->port_id;
-
-		/*
-		 * The vlan_tci field is only valid when PKT_RX_VLAN_PKT is
-		 * set in the pkt_flags field.
-		 */
-		first_seg->vlan_tci = rte_le_to_cpu_16(rxd.wb.upper.vlan);
-		hlen_type_rss = rte_le_to_cpu_32(rxd.wb.lower.lo_dword.data);
-		pkt_flags = rx_desc_hlen_type_rss_to_pkt_flags(hlen_type_rss);
-		pkt_flags = (pkt_flags |
-				rx_desc_status_to_pkt_flags(staterr));
-		pkt_flags = (pkt_flags |
-				rx_desc_error_to_pkt_flags(staterr));
-		first_seg->ol_flags = pkt_flags;
-
-		if (likely(pkt_flags & PKT_RX_RSS_HASH))
-			first_seg->hash.rss = rxd.wb.lower.hi_dword.rss;
-		else if (pkt_flags & PKT_RX_FDIR) {
-			first_seg->hash.fdir.hash =
-				(uint16_t)((rxd.wb.lower.hi_dword.csum_ip.csum)
-					   & IXGBE_ATR_HASH_MASK);
-			first_seg->hash.fdir.id =
-				rxd.wb.lower.hi_dword.csum_ip.ip_id;
-		}
+		/* Initialize the first mbuf of the returned packet */
+		ixgbe_fill_cluster_head_buf(first_seg, &rxd, rxq->port_id,
+					    staterr);
 
 		/* Prefetch data of first segment, if configured to do so. */
 		rte_packet_prefetch((char *)first_seg->buf_addr +
@@ -1999,6 +2314,7 @@ ixgbe_rx_queue_release(struct igb_rx_queue *rxq)
 	if (rxq != NULL) {
 		ixgbe_rx_queue_release_mbufs(rxq);
 		rte_free(rxq->sw_ring);
+		rte_free(rxq->sw_rsc_ring);
 		rte_free(rxq);
 	}
 }
@@ -2126,6 +2442,7 @@ ixgbe_reset_rx_queue(struct igb_rx_queue *rxq)
 	rxq->nb_rx_hold = 0;
 	rxq->pkt_first_seg = NULL;
 	rxq->pkt_last_seg = NULL;
+	rxq->rsc_en = 0;
 }
 
 int
@@ -2141,6 +2458,14 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	struct ixgbe_hw     *hw;
 	int use_def_burst_func = 1;
 	uint16_t len;
+	struct rte_eth_dev_info dev_info = { 0 };
+	struct rte_eth_rxmode *dev_rx_mode = &dev->data->dev_conf.rxmode;
+	bool rsc_requested = false;
+
+	dev->dev_ops->dev_infos_get(dev, &dev_info);
+	if ((dev_info.rx_offload_capa & DEV_RX_OFFLOAD_TCP_LRO) &&
+	    dev_rx_mode->enable_lro)
+		rsc_requested = true;
 
 	PMD_INIT_FUNC_TRACE();
 	hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
@@ -2229,15 +2554,33 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 #else
 	len = nb_desc;
 #endif
-	rxq->sw_ring = rte_zmalloc_socket("rxq->sw_ring",
-					  sizeof(struct igb_rx_entry) * len,
-					  RTE_CACHE_LINE_SIZE, socket_id);
-	if (rxq->sw_ring == NULL) {
+	rxq->sw_ring =
+		rte_zmalloc_socket("rxq->sw_ring",
+				   sizeof(struct igb_rx_entry) * len,
+				   RTE_CACHE_LINE_SIZE, socket_id);
+
+	if (!rxq->sw_ring) {
 		ixgbe_rx_queue_release(rxq);
 		return (-ENOMEM);
 	}
-	PMD_INIT_LOG(DEBUG, "sw_ring=%p hw_ring=%p dma_addr=0x%"PRIx64,
-		     rxq->sw_ring, rxq->rx_ring, rxq->rx_ring_phys_addr);
+
+	if (rsc_requested) {
+		rxq->sw_rsc_ring =
+			rte_zmalloc_socket("rxq->sw_rsc_ring",
+					   sizeof(struct igb_rsc_entry) * len,
+					   RTE_CACHE_LINE_SIZE, socket_id);
+		if (!rxq->sw_rsc_ring) {
+			ixgbe_rx_queue_release(rxq);
+			return (-ENOMEM);
+		}
+	} else {
+		rxq->sw_rsc_ring = NULL;
+	}
+
+	PMD_INIT_LOG(DEBUG, "sw_ring=%p sw_rsc_ring=%p hw_ring=%p "
+			    "dma_addr=0x%"PRIx64,
+		     rxq->sw_ring, rxq->sw_rsc_ring, rxq->rx_ring,
+		     rxq->rx_ring_phys_addr);
 
 	/*
 	 * Certain constraints must be met in order to use the bulk buffer
@@ -2248,6 +2591,12 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 #ifdef RTE_IXGBE_INC_VECTOR
 	ixgbe_rxq_vec_setup(rxq);
 #endif
+	/*
+	 * TODO: This must be moved to ixgbe_dev_rx_init() since rx_pkt_burst
+	 * is a global per-device callback thus bulk allocation may be used
+	 * only if all queues meet the above preconditions.
+	 */
+
 	/* Check if pre-conditions are satisfied, and no Scattered Rx */
 	if (!use_def_burst_func && !dev->data->scattered_rx) {
 #ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
@@ -2271,6 +2620,7 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 			     "enabled (port=%d, queue=%d).",
 			     rxq->port_id, rxq->queue_id);
 	}
+
 	dev->data->rx_queues[queue_idx] = rxq;
 
 	ixgbe_reset_rx_queue(rxq);
@@ -3504,6 +3854,83 @@ ixgbe_dev_mq_tx_configure(struct rte_eth_dev *dev)
 	return 0;
 }
 
+/**
+ * get_rscctl_maxdesc_82599EB - Calculate the RSCCTL[n].MAXDESC for 82599 PF
+ *
+ * Return the RSCCTL[n].MAXDESC for 82599 and x540 PF devices according to the
+ * spec rev. 3.0 chapter 8.2.3.8.13.
+ *
+ * @pool Memory pool of the Rx queue
+ */
+static inline uint32_t get_rscctl_maxdesc(struct rte_mempool *pool)
+{
+	struct rte_pktmbuf_pool_private *mp_priv = rte_mempool_get_priv(pool);
+
+	/* MAXDESC * SRRCTL.BSIZEPKT must not exceed 64 KB minus one */
+	uint16_t maxdesc =
+		65535 / (mp_priv->mbuf_data_room_size - RTE_PKTMBUF_HEADROOM);
+
+	if (maxdesc >= 16)
+		return IXGBE_RSCCTL_MAXDESC_16;
+	else if (maxdesc >= 8)
+		return IXGBE_RSCCTL_MAXDESC_8;
+	else if (maxdesc >= 4)
+		return IXGBE_RSCCTL_MAXDESC_4;
+	else
+		return IXGBE_RSCCTL_MAXDESC_1;
+}
+
+/**
+ * ixgbe_set_ivar - set the IVAR registers, mapping interrupt causes to vectors
+ * @adapter: pointer to adapter struct
+ * @direction: 0 for Rx, 1 for Tx, -1 for other causes
+ * @queue: queue to map the corresponding interrupt to
+ * @msix_vector: the vector to map to the corresponding queue
+ *
+ */
+static void ixgbe_set_ivar(struct ixgbe_hw *hw, int8_t direction,
+			   uint8_t queue, uint8_t msix_vector)
+{
+	u32 ivar, index;
+	switch (hw->mac.type) {
+	case ixgbe_mac_82598EB:
+		msix_vector |= IXGBE_IVAR_ALLOC_VAL;
+		if (direction == -1)
+			direction = 0;
+		index = (((direction * 64) + queue) >> 2) & 0x1F;
+		ivar = IXGBE_READ_REG(hw, IXGBE_IVAR(index));
+		ivar &= ~(0xFF << (8 * (queue & 0x3)));
+		ivar |= (msix_vector << (8 * (queue & 0x3)));
+		IXGBE_WRITE_REG(hw, IXGBE_IVAR(index), ivar);
+		break;
+	case ixgbe_mac_82599EB:
+	case ixgbe_mac_X540:
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
+		if (direction == -1) {
+			/* other causes */
+			msix_vector |= IXGBE_IVAR_ALLOC_VAL;
+			index = ((queue & 1) * 8);
+			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR_MISC);
+			ivar &= ~(0xFF << index);
+			ivar |= (msix_vector << index);
+			IXGBE_WRITE_REG(hw, IXGBE_IVAR_MISC, ivar);
+			break;
+		} else {
+			/* tx or rx causes */
+			msix_vector |= IXGBE_IVAR_ALLOC_VAL;
+			index = ((16 * (queue & 1)) + (8 * direction));
+			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR(queue >> 1));
+			ivar &= ~(0xFF << index);
+			ivar |= (msix_vector << index);
+			IXGBE_WRITE_REG(hw, IXGBE_IVAR(queue >> 1), ivar);
+			break;
+		}
+	default:
+		break;
+	}
+}
+
 /*
  * Initializes Receive Unit.
  */
@@ -3520,9 +3947,27 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	uint32_t maxfrs;
 	uint32_t srrctl;
 	uint32_t rdrxctl;
+	uint32_t rscctl;
+	uint32_t psrtype;
+	uint32_t rfctl;
 	uint32_t rxcsum;
 	uint16_t buf_size;
 	uint16_t i;
+	struct rte_eth_rxmode *rx_conf = &dev->data->dev_conf.rxmode;
+	struct rte_eth_dev_info dev_info = { 0 };
+	bool rsc_capable = false;
+	int bulk_alloc_cond = 0;
+
+	/* Sanity check */
+	dev->dev_ops->dev_infos_get(dev, &dev_info);
+	if (dev_info.rx_offload_capa & DEV_RX_OFFLOAD_TCP_LRO)
+		rsc_capable = true;
+
+	if (!rsc_capable && rx_conf->enable_lro) {
+		PMD_INIT_LOG(CRIT, "LRO is requested on HW that doesn't "
+				   "support it");
+		return -EINVAL;
+	}
 
 	PMD_INIT_FUNC_TRACE();
 	hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
@@ -3542,22 +3987,53 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	IXGBE_WRITE_REG(hw, IXGBE_FCTRL, fctrl);
 
 	/*
+	 * RFCTL configuration
+	 *
+	 * Since NFS packets coalescing is not supported - clear RFCTL.NFSW_DIS
+	 * and RFCTL.NFSR_DIS when RSC is enabled.
+	 */
+	if (rsc_capable) {
+		rfctl = IXGBE_READ_REG(hw, IXGBE_RFCTL);
+		if (rx_conf->enable_lro) {
+			rfctl &= ~(IXGBE_RFCTL_RSC_DIS | IXGBE_RFCTL_NFSW_DIS |
+				   IXGBE_RFCTL_NFSR_DIS);
+		} else {
+			rfctl |= IXGBE_RFCTL_RSC_DIS;
+		}
+
+		IXGBE_WRITE_REG(hw, IXGBE_RFCTL, rfctl);
+	}
+
+
+	/*
 	 * Configure CRC stripping, if any.
 	 */
 	hlreg0 = IXGBE_READ_REG(hw, IXGBE_HLREG0);
-	if (dev->data->dev_conf.rxmode.hw_strip_crc)
+	if (rx_conf->hw_strip_crc)
 		hlreg0 |= IXGBE_HLREG0_RXCRCSTRP;
-	else
+	else {
 		hlreg0 &= ~IXGBE_HLREG0_RXCRCSTRP;
+		if (rx_conf->enable_lro) {
+			/*
+			 * According to chapter of 4.6.7.2.1 of the Spec Rev.
+			 * 3.0 RSC configuration requires HW CRC stripping being
+			 * enabled. If user requested both HW CRC stripping off
+			 * and RSC on - return an error.
+			 */
+			PMD_INIT_LOG(CRIT, "LRO can't be enabled when HW CRC "
+					    "is disabled");
+			return -EINVAL;
+		}
+	}
 
 	/*
 	 * Configure jumbo frame support, if any.
 	 */
-	if (dev->data->dev_conf.rxmode.jumbo_frame == 1) {
+	if (rx_conf->jumbo_frame == 1) {
 		hlreg0 |= IXGBE_HLREG0_JUMBOEN;
 		maxfrs = IXGBE_READ_REG(hw, IXGBE_MAXFRS);
 		maxfrs &= 0x0000FFFF;
-		maxfrs |= (dev->data->dev_conf.rxmode.max_rx_pkt_len << 16);
+		maxfrs |= (rx_conf->max_rx_pkt_len << 16);
 		IXGBE_WRITE_REG(hw, IXGBE_MAXFRS, maxfrs);
 	} else
 		hlreg0 &= ~IXGBE_HLREG0_JUMBOEN;
@@ -3581,9 +4057,8 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		 * Reset crc_len in case it was changed after queue setup by a
 		 * call to configure.
 		 */
-		rxq->crc_len = (uint8_t)
-				((dev->data->dev_conf.rxmode.hw_strip_crc) ? 0 :
-				ETHER_CRC_LEN);
+		rxq->crc_len =
+			(uint8_t)((rx_conf->hw_strip_crc) ? 0 : ETHER_CRC_LEN);
 
 		/* Setup the Base and Length of the Rx Descriptor Rings */
 		bus_addr = rxq->rx_ring_phys_addr;
@@ -3601,23 +4076,47 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		/*
 		 * Configure Header Split
 		 */
-		if (dev->data->dev_conf.rxmode.header_split) {
+		if (rx_conf->header_split) {
+                        /*
+			 * Print a warning if split_hdr_size is less
+			 * than 128 bytes when RSC is requested.
+			 */
+			if (rx_conf->enable_lro &&
+			    rx_conf->split_hdr_size < 128)
+				PMD_INIT_LOG(INFO, "split_hdr_size less than "
+						   "128 bytes (%d)!",
+					     rx_conf->split_hdr_size);
+
 			if (hw->mac.type == ixgbe_mac_82599EB) {
+
+				
 				/* Must setup the PSRTYPE register */
-				uint32_t psrtype;
 				psrtype = IXGBE_PSRTYPE_TCPHDR |
 					IXGBE_PSRTYPE_UDPHDR   |
 					IXGBE_PSRTYPE_IPV4HDR  |
 					IXGBE_PSRTYPE_IPV6HDR;
 				IXGBE_WRITE_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx), psrtype);
 			}
-			srrctl = ((dev->data->dev_conf.rxmode.split_hdr_size <<
+			srrctl = ((rx_conf->split_hdr_size <<
 				IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
 				IXGBE_SRRCTL_BSIZEHDR_MASK);
 			srrctl |= IXGBE_SRRCTL_DESCTYPE_HDR_SPLIT_ALWAYS;
 		} else
 #endif
+		{
 			srrctl = IXGBE_SRRCTL_DESCTYPE_ADV_ONEBUF;
+			/*
+			 * Following the 4.6.7.2.1 chapter of the 82599 Spec if
+			 * LRO is enabled the SRRCTL[n].BSIZEHEADER should be
+			 * configured even if header split is not enabled. In
+			 * the later case we will configure it 128 bytes
+			 * following the recomendation in the spec.
+			 */
+			if (rx_conf->enable_lro)
+				srrctl |=
+				     ((128 << IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
+						    IXGBE_SRRCTL_BSIZEHDR_MASK);
+		}
 
 		/* Set if packets are dropped when no descriptors available */
 		if (rxq->drop_en)
@@ -3634,16 +4133,21 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 				       RTE_PKTMBUF_HEADROOM);
 		srrctl |= ((buf_size >> IXGBE_SRRCTL_BSIZEPKT_SHIFT) &
 			   IXGBE_SRRCTL_BSIZEPKT_MASK);
+
+		/* Set the Receive Descriptor Minimum Threshold Size */
+		//srrctl |= (0x1UL << IXGBE_SRRCTL_RDMTS_SHIFT) &
+		//					IXGBE_SRRCTL_RDMTS_MASK;
+
 		IXGBE_WRITE_REG(hw, IXGBE_SRRCTL(rxq->reg_idx), srrctl);
 
 		buf_size = (uint16_t) ((srrctl & IXGBE_SRRCTL_BSIZEPKT_MASK) <<
 				       IXGBE_SRRCTL_BSIZEPKT_SHIFT);
 
 		/* It adds dual VLAN length for supporting dual VLAN */
-		if ((dev->data->dev_conf.rxmode.max_rx_pkt_len +
-				2 * IXGBE_VLAN_TAG_SIZE) > buf_size){
+		if ((rx_conf->max_rx_pkt_len + 2 * IXGBE_VLAN_TAG_SIZE) >
+								     buf_size) {
 			if (!dev->data->scattered_rx)
-				PMD_INIT_LOG(DEBUG, "forcing scatter mode");
+				PMD_INIT_LOG(INFO, "forcing scatter mode");
 			dev->data->scattered_rx = 1;
 #ifdef RTE_IXGBE_INC_VECTOR
 			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_vec;
@@ -3651,11 +4155,41 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
 #endif
 		}
+
+		/* RSC per-queue configuration */
+		if (rx_conf->enable_lro) {
+			uint32_t eitr;
+
+			rscctl =
+				IXGBE_READ_REG(hw, IXGBE_RSCCTL(rxq->reg_idx));
+			psrtype =
+				IXGBE_READ_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx));
+			eitr = IXGBE_READ_REG(hw, IXGBE_EITR(rxq->reg_idx));
+			
+			rscctl |= IXGBE_RSCCTL_RSCEN;
+			rscctl |= get_rscctl_maxdesc(rxq->mb_pool);
+			psrtype |= IXGBE_PSRTYPE_TCPHDR;
+			/* Value taken from ixgbe Linux driver */
+			eitr   |= (1950 | IXGBE_EITR_CNT_WDIS);
+
+			IXGBE_WRITE_REG(hw, IXGBE_RSCCTL(rxq->reg_idx), rscctl);
+			IXGBE_WRITE_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx),
+								       psrtype);
+			IXGBE_WRITE_REG(hw, IXGBE_EITR(rxq->reg_idx), eitr);
+
+			rxq->rsc_en = 1;
+		}
+
+		/*
+		 * We may use bulk allocation only all queues satisfy the
+		 * preconditions.
+		 */
+		bulk_alloc_cond |= check_rx_burst_bulk_alloc_preconditions(rxq);
 	}
 
-	if (dev->data->dev_conf.rxmode.enable_scatter) {
+	if (rx_conf->enable_scatter) {
 		if (!dev->data->scattered_rx)
-			PMD_INIT_LOG(DEBUG, "forcing scatter mode");
+			PMD_INIT_LOG(INFO, "forcing scatter mode");
 #ifdef RTE_IXGBE_INC_VECTOR
 		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_vec;
 #else
@@ -3676,22 +4210,58 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	 */
 	rxcsum = IXGBE_READ_REG(hw, IXGBE_RXCSUM);
 	rxcsum |= IXGBE_RXCSUM_PCSD;
-	if (dev->data->dev_conf.rxmode.hw_ip_checksum)
+	if (rx_conf->hw_ip_checksum)
 		rxcsum |= IXGBE_RXCSUM_IPPCSE;
 	else
 		rxcsum &= ~IXGBE_RXCSUM_IPPCSE;
 
 	IXGBE_WRITE_REG(hw, IXGBE_RXCSUM, rxcsum);
 
-	if (hw->mac.type == ixgbe_mac_82599EB) {
+	if (hw->mac.type == ixgbe_mac_82599EB ||
+	    hw->mac.type == ixgbe_mac_X540) {
 		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
-		if (dev->data->dev_conf.rxmode.hw_strip_crc)
+		if (rx_conf->hw_strip_crc)
 			rdrxctl |= IXGBE_RDRXCTL_CRCSTRIP;
 		else
 			rdrxctl &= ~IXGBE_RDRXCTL_CRCSTRIP;
+
 		rdrxctl &= ~IXGBE_RDRXCTL_RSCFRSTSIZE;
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
 	}
+
+	/* Finalize RSC configuration  */
+	if (rx_conf->enable_lro) {
+		/*
+		 * Follow the instructions in the 4.6.7.2.1 of the Spec Rev. 3.0
+		 */
+		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
+		rdrxctl |= IXGBE_RDRXCTL_RSCACKC;
+		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
+
+		ixgbe_set_ivar(hw, 0, 0, 0);
+		ixgbe_set_ivar(hw, 1, 0, 0);
+
+		PMD_INIT_LOG(INFO, "enabling LRO mode");
+
+		dev->data->lro = 1;
+		/*
+		 * Initialize the appropriate LRO callback. If all queues
+		 * satisfy the bulk allocation preconditions (bulk_alloc_cond
+		 * is zero) then we may use bulk allocation. Otherwise use a
+		 * single allocation version.
+		 */
+		if (!bulk_alloc_cond) {
+			PMD_INIT_LOG(INFO, "LRO is requested. Using a bulk "
+					   "allocation version");
+			dev->rx_pkt_burst = ixgbe_recv_pkts_lro_bulk_alloc;
+			dev->data->lro_bulk_alloc = 1;
+		} else {
+			PMD_INIT_LOG(INFO, "LRO is requested. Using a single "
+					   "allocation version");
+			dev->rx_pkt_burst = ixgbe_recv_pkts_lro;
+		}
+	}
+
 
 	return 0;
 }
