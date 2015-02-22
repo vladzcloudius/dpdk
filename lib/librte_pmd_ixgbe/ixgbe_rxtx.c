@@ -3605,7 +3605,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 			 * enabled. If user requested both HW CRC stripping off
 			 * and RSC on - return an error.
 			 */
-			PMD_INIT_LOG(DEBUG, "LRO can't be enabled when HW CRC "
+			PMD_INIT_LOG(CRIT, "LRO can't be enabled when HW CRC "
 					    "is disabled");
 			return -EINVAL;
 		}
@@ -3670,7 +3670,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 				 */
 				if (rx_conf->enable_scatter) {
 					if (rx_conf->split_hdr_size < 128) {
-						PMD_INIT_LOG(DEBUG,
+						PMD_INIT_LOG(INFO,
 							"split_hdr_size less "
 							"than 128 bytes! This "
 							"may cause a problem.");
@@ -3730,7 +3730,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		if ((rx_conf->max_rx_pkt_len + 2 * IXGBE_VLAN_TAG_SIZE) >
 								     buf_size) {
 			if (!dev->data->scattered_rx)
-				PMD_INIT_LOG(DEBUG, "forcing scatter mode");
+				PMD_INIT_LOG(INFO, "forcing scatter mode");
 			dev->data->scattered_rx = 1;
 #ifdef RTE_IXGBE_INC_VECTOR
 			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_vec;
@@ -3760,7 +3760,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 	if (rx_conf->enable_scatter) {
 		if (!dev->data->scattered_rx)
-			PMD_INIT_LOG(DEBUG, "forcing scatter mode");
+			PMD_INIT_LOG(INFO, "forcing scatter mode");
 #ifdef RTE_IXGBE_INC_VECTOR
 		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_vec;
 #else
