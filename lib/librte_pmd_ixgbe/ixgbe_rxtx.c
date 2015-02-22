@@ -3504,6 +3504,31 @@ ixgbe_dev_mq_tx_configure(struct rte_eth_dev *dev)
 	return 0;
 }
 
+/**
+ * get_rscctl_maxdesc_82599EB - Calculate the RSCCTL[n].MAXDESC for 82599 PF
+ *
+ * Return the RSCCTL[n].MAXDESC for 82599 PF device according to the spec
+ * rev. 3.0 chapter 8.2.3.8.13.
+ *
+ * @pool Memory pool of the Rx queue
+ */
+static inline uint32_t get_rscctl_maxdesc_82599EB(struct rte_mempool *pool)
+{
+	struct rte_pktmbuf_pool_private *mp_priv = rte_mempool_get_priv(pool);
+
+	/* MAXDESC * SRRCTL.BSIZEPKT must not exceed 64 KB minus one */
+	uint16_t maxdesc =
+		65535 / (mp_priv->mbuf_data_room_size - RTE_PKTMBUF_HEADROOM);
+
+	if (maxdesc >= 16)
+		return IXGBE_RSCCTL_MAXDESC_16;
+	else if (maxdesc >= 8)
+		return IXGBE_RSCCTL_MAXDESC_8;
+	else if (maxdesc >= 4)
+		return IXGBE_RSCCTL_MAXDESC_4;
+	else
+		return IXGBE_RSCCTL_MAXDESC_1;
+}
 /*
  * Initializes Receive Unit.
  */
@@ -3520,9 +3545,13 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	uint32_t maxfrs;
 	uint32_t srrctl;
 	uint32_t rdrxctl;
+	uint32_t rscctl;
+	uint32_t psrtype;
+	uint32_t rfctl;
 	uint32_t rxcsum;
 	uint16_t buf_size;
 	uint16_t i;
+	struct rte_eth_rxmode *rx_conf = &dev->data->dev_conf.rxmode;
 
 	PMD_INIT_FUNC_TRACE();
 	hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
@@ -3542,22 +3571,54 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	IXGBE_WRITE_REG(hw, IXGBE_FCTRL, fctrl);
 
 	/*
+	 * RFCTL configuration
+	 *
+	 * Since NFS packets coalescing is not supported - clear RFCTL.NFSW_DIS
+	 * and RFCTL.NFSR_DIS when RSC is enabled.
+	 */
+	rfctl = IXGBE_READ_REG(hw, IXGBE_RFCTL);
+	if (rx_conf->enable_scatter) {
+		if (hw->mac.type == ixgbe_mac_82599EB)
+			rfctl &= ~(IXGBE_RFCTL_RSC_DIS | IXGBE_RFCTL_NFSW_DIS |
+				   IXGBE_RFCTL_NFSR_DIS);
+	} else {
+		if (hw->mac.type == ixgbe_mac_82599EB)
+			rfctl |= IXGBE_RFCTL_RSC_DIS;
+	}
+
+	IXGBE_WRITE_REG(hw, IXGBE_RFCTL, rfctl);
+
+
+	/*
 	 * Configure CRC stripping, if any.
 	 */
 	hlreg0 = IXGBE_READ_REG(hw, IXGBE_HLREG0);
-	if (dev->data->dev_conf.rxmode.hw_strip_crc)
+	if (rx_conf->hw_strip_crc)
 		hlreg0 |= IXGBE_HLREG0_RXCRCSTRP;
-	else
+	else {
 		hlreg0 &= ~IXGBE_HLREG0_RXCRCSTRP;
+		if (hw->mac.type == ixgbe_mac_82599EB &&
+		    rx_conf->enable_scatter) {
+			/*
+			 * According to chapter of 4.6.7.2.1 of the Spec Rev.
+			 * 3.0 RSC configuration requires HW CRC stripping being
+			 * enabled. If user requested both HW CRC stripping off
+			 * and RSC on - return an error.
+			 */
+			PMD_INIT_LOG(DEBUG, "LRO can't be enabled when HW CRC "
+					    "is disabled");
+			return -EINVAL;
+		}
+	}
 
 	/*
 	 * Configure jumbo frame support, if any.
 	 */
-	if (dev->data->dev_conf.rxmode.jumbo_frame == 1) {
+	if (rx_conf->jumbo_frame == 1) {
 		hlreg0 |= IXGBE_HLREG0_JUMBOEN;
 		maxfrs = IXGBE_READ_REG(hw, IXGBE_MAXFRS);
 		maxfrs &= 0x0000FFFF;
-		maxfrs |= (dev->data->dev_conf.rxmode.max_rx_pkt_len << 16);
+		maxfrs |= (rx_conf->max_rx_pkt_len << 16);
 		IXGBE_WRITE_REG(hw, IXGBE_MAXFRS, maxfrs);
 	} else
 		hlreg0 &= ~IXGBE_HLREG0_JUMBOEN;
@@ -3581,9 +3642,8 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		 * Reset crc_len in case it was changed after queue setup by a
 		 * call to configure.
 		 */
-		rxq->crc_len = (uint8_t)
-				((dev->data->dev_conf.rxmode.hw_strip_crc) ? 0 :
-				ETHER_CRC_LEN);
+		rxq->crc_len =
+			(uint8_t)((rx_conf->hw_strip_crc) ? 0 : ETHER_CRC_LEN);
 
 		/* Setup the Base and Length of the Rx Descriptor Rings */
 		bus_addr = rxq->rx_ring_phys_addr;
@@ -3601,23 +3661,50 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		/*
 		 * Configure Header Split
 		 */
-		if (dev->data->dev_conf.rxmode.header_split) {
+		if (rx_conf->header_split) {
 			if (hw->mac.type == ixgbe_mac_82599EB) {
+
+				/*
+				 * Print a warning if split_hdr_size is less
+				 * than 128 bytes when RSC is requested.
+				 */
+				if (rx_conf->enable_scatter) {
+					if (rx_conf->split_hdr_size < 128) {
+						PMD_INIT_LOG(DEBUG,
+							"split_hdr_size less "
+							"than 128 bytes! This "
+							"may cause a problem.");
+					}
+				}
 				/* Must setup the PSRTYPE register */
-				uint32_t psrtype;
 				psrtype = IXGBE_PSRTYPE_TCPHDR |
 					IXGBE_PSRTYPE_UDPHDR   |
 					IXGBE_PSRTYPE_IPV4HDR  |
 					IXGBE_PSRTYPE_IPV6HDR;
 				IXGBE_WRITE_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx), psrtype);
 			}
-			srrctl = ((dev->data->dev_conf.rxmode.split_hdr_size <<
+			srrctl = ((rx_conf->split_hdr_size <<
 				IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
 				IXGBE_SRRCTL_BSIZEHDR_MASK);
 			srrctl |= IXGBE_SRRCTL_DESCTYPE_HDR_SPLIT_ALWAYS;
 		} else
 #endif
+		{
 			srrctl = IXGBE_SRRCTL_DESCTYPE_ADV_ONEBUF;
+			/*
+			 * Following the 4.6.7.2.1 chapter of the 82599 Spec if
+			 * LRO is enabled the SRRCTL[n].BSIZEHEADER should be
+			 * configured even if header split is not enabled. In
+			 * the later case we will configure it 128 bytes
+			 * following the recomendation in the spec.
+			 */
+			if (rx_conf->enable_scatter &&
+			    hw->mac.type == ixgbe_mac_82599EB) {
+				srrctl |=
+				     ((128 << IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
+						    IXGBE_SRRCTL_BSIZEHDR_MASK);
+			}
+		}
 
 		/* Set if packets are dropped when no descriptors available */
 		if (rxq->drop_en)
@@ -3640,8 +3727,8 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 				       IXGBE_SRRCTL_BSIZEPKT_SHIFT);
 
 		/* It adds dual VLAN length for supporting dual VLAN */
-		if ((dev->data->dev_conf.rxmode.max_rx_pkt_len +
-				2 * IXGBE_VLAN_TAG_SIZE) > buf_size){
+		if ((rx_conf->max_rx_pkt_len + 2 * IXGBE_VLAN_TAG_SIZE) >
+								     buf_size) {
 			if (!dev->data->scattered_rx)
 				PMD_INIT_LOG(DEBUG, "forcing scatter mode");
 			dev->data->scattered_rx = 1;
@@ -3651,9 +3738,27 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
 #endif
 		}
+
+		/* RSC per-queue configuration */
+		if (rx_conf->enable_scatter) {
+			rscctl =
+				IXGBE_READ_REG(hw, IXGBE_RSCCTL(rxq->reg_idx));
+			psrtype =
+				IXGBE_READ_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx));
+			if (hw->mac.type == ixgbe_mac_82599EB) {
+				rscctl |= IXGBE_RSCCTL_RSCEN;
+				rscctl |=
+				       get_rscctl_maxdesc_82599EB(rxq->mb_pool);
+				psrtype |= IXGBE_PSRTYPE_TCPHDR;
+			}
+
+			IXGBE_WRITE_REG(hw, IXGBE_RSCCTL(rxq->reg_idx), rscctl);
+			IXGBE_WRITE_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx),
+								       psrtype);
+		}
 	}
 
-	if (dev->data->dev_conf.rxmode.enable_scatter) {
+	if (rx_conf->enable_scatter) {
 		if (!dev->data->scattered_rx)
 			PMD_INIT_LOG(DEBUG, "forcing scatter mode");
 #ifdef RTE_IXGBE_INC_VECTOR
@@ -3676,7 +3781,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	 */
 	rxcsum = IXGBE_READ_REG(hw, IXGBE_RXCSUM);
 	rxcsum |= IXGBE_RXCSUM_PCSD;
-	if (dev->data->dev_conf.rxmode.hw_ip_checksum)
+	if (rx_conf->hw_ip_checksum)
 		rxcsum |= IXGBE_RXCSUM_IPPCSE;
 	else
 		rxcsum &= ~IXGBE_RXCSUM_IPPCSE;
@@ -3685,11 +3790,19 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 	if (hw->mac.type == ixgbe_mac_82599EB) {
 		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
-		if (dev->data->dev_conf.rxmode.hw_strip_crc)
+		if (rx_conf->hw_strip_crc)
 			rdrxctl |= IXGBE_RDRXCTL_CRCSTRIP;
 		else
 			rdrxctl &= ~IXGBE_RDRXCTL_CRCSTRIP;
 		rdrxctl &= ~IXGBE_RDRXCTL_RSCFRSTSIZE;
+
+		/*
+		 * Configure RSC: follow the instructions in the 4.6.7.2.1 of
+		 * the Spec Rev. 3.0.
+		 */
+		if (rx_conf->enable_scatter)
+			rdrxctl |= IXGBE_RDRXCTL_RSCACKC;
+
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
 	}
 
