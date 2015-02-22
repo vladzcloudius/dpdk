@@ -3529,6 +3529,58 @@ static inline uint32_t get_rscctl_maxdesc(struct rte_mempool *pool)
 	else
 		return IXGBE_RSCCTL_MAXDESC_1;
 }
+
+/**
+ * ixgbe_set_ivar - set the IVAR registers, mapping interrupt causes to vectors
+ * @adapter: pointer to adapter struct
+ * @direction: 0 for Rx, 1 for Tx, -1 for other causes
+ * @queue: queue to map the corresponding interrupt to
+ * @msix_vector: the vector to map to the corresponding queue
+ *
+ */
+static void ixgbe_set_ivar(struct ixgbe_hw *hw, int8_t direction,
+			   uint8_t queue, uint8_t msix_vector)
+{
+	u32 ivar, index;
+	switch (hw->mac.type) {
+	case ixgbe_mac_82598EB:
+		msix_vector |= IXGBE_IVAR_ALLOC_VAL;
+		if (direction == -1)
+			direction = 0;
+		index = (((direction * 64) + queue) >> 2) & 0x1F;
+		ivar = IXGBE_READ_REG(hw, IXGBE_IVAR(index));
+		ivar &= ~(0xFF << (8 * (queue & 0x3)));
+		ivar |= (msix_vector << (8 * (queue & 0x3)));
+		IXGBE_WRITE_REG(hw, IXGBE_IVAR(index), ivar);
+		break;
+	case ixgbe_mac_82599EB:
+	case ixgbe_mac_X540:
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
+		if (direction == -1) {
+			/* other causes */
+			msix_vector |= IXGBE_IVAR_ALLOC_VAL;
+			index = ((queue & 1) * 8);
+			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR_MISC);
+			ivar &= ~(0xFF << index);
+			ivar |= (msix_vector << index);
+			IXGBE_WRITE_REG(hw, IXGBE_IVAR_MISC, ivar);
+			break;
+		} else {
+			/* tx or rx causes */
+			msix_vector |= IXGBE_IVAR_ALLOC_VAL;
+			index = ((16 * (queue & 1)) + (8 * direction));
+			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR(queue >> 1));
+			ivar &= ~(0xFF << index);
+			ivar |= (msix_vector << index);
+			IXGBE_WRITE_REG(hw, IXGBE_IVAR(queue >> 1), ivar);
+			break;
+		}
+	default:
+		break;
+	}
+}
+
 /*
  * Initializes Receive Unit.
  */
@@ -3750,18 +3802,25 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 		/* RSC per-queue configuration */
 		if (rx_conf->enable_scatter) {
+			uint32_t eitr;
+
 			rscctl =
 				IXGBE_READ_REG(hw, IXGBE_RSCCTL(rxq->reg_idx));
 			psrtype =
 				IXGBE_READ_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx));
+			eitr = IXGBE_READ_REG(hw, IXGBE_EITR(rxq->reg_idx));
 			
 			rscctl |= IXGBE_RSCCTL_RSCEN;
 			rscctl |= get_rscctl_maxdesc(rxq->mb_pool);
-			psrtype |= IXGBE_PSRTYPE_TCPHDR;		
+			psrtype |= IXGBE_PSRTYPE_TCPHDR;
+			/* Value taken from ixgbe Linux driver */
+			eitr   |= (1950 | IXGBE_EITR_CNT_WDIS);
 
 			IXGBE_WRITE_REG(hw, IXGBE_RSCCTL(rxq->reg_idx), rscctl);
 			IXGBE_WRITE_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx),
 								       psrtype);
+			IXGBE_WRITE_REG(hw, IXGBE_EITR(rxq->reg_idx), eitr);
+
 		}
 	}
 
@@ -3815,6 +3874,9 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
 		rdrxctl |= IXGBE_RDRXCTL_RSCACKC;
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
+
+		ixgbe_set_ivar(hw, 0, 0, 0);
+		ixgbe_set_ivar(hw, 1, 0, 0);
 	}
 
 
