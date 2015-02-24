@@ -1560,11 +1560,11 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		 * update the pointer to the first mbuf of the current scattered
 		 * packet and continue to parse the RX ring.
 		 */
+		rx_id = next_id;
 		if (!eop) {
 			rxm->next = next_rxe->mbuf;
 			next_rxe->fbuf = first_seg;
 			prev_id = rx_id;
-			rx_id = next_id;
 			goto next_desc;
 		}
 
@@ -2305,7 +2305,8 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	ixgbe_rxq_vec_setup(rxq);
 #endif
 	/* Check if pre-conditions are satisfied, and no Scattered Rx */
-	if (!use_def_burst_func && !dev->data->scattered_rx) {
+	if (!use_def_burst_func && !dev->data->scattered_rx &&
+	    !dev->data->lro) {
 #ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
 		PMD_INIT_LOG(DEBUG, "Rx Burst Bulk Alloc Preconditions are "
 			     "satisfied. Rx Burst Bulk Alloc function will be "
@@ -3939,6 +3940,8 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 		ixgbe_set_ivar(hw, 0, 0, 0);
 		ixgbe_set_ivar(hw, 1, 0, 0);
+
+		PMD_INIT_LOG(INFO, "enabling LRO mode");
 
 		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
 		dev->data->lro = 1;
