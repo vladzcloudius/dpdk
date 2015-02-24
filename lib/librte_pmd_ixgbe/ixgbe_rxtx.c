@@ -1355,6 +1355,17 @@ ixgbe_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	return (nb_rx);
 }
 
+/**
+ * Used to detect a descriptor that has
+ * been merged by Hardware RSC.
+ */
+static inline uint32_t ixgbe_rsc_count(union ixgbe_adv_rx_desc *rx)
+{
+	return (rte_le_to_cpu_32(rx->wb.lower.lo_dword.data) &
+		IXGBE_RXDADV_RSCCNT_MASK) >> IXGBE_RXDADV_RSCCNT_SHIFT;
+}
+
+
 uint16_t
 ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			  uint16_t nb_pkts)
@@ -1364,19 +1375,23 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	volatile union ixgbe_adv_rx_desc *rxdp;
 	struct igb_rx_entry *sw_ring;
 	struct igb_rx_entry *rxe;
+	struct igb_rx_entry *next_rxe = NULL;
 	struct rte_mbuf *first_seg;
-	struct rte_mbuf *last_seg;
 	struct rte_mbuf *rxm;
 	struct rte_mbuf *nmb;
 	union ixgbe_adv_rx_desc rxd;
 	uint64_t dma; /* Physical address of mbuf data buffer */
 	uint32_t staterr;
 	uint32_t hlen_type_rss;
-	uint16_t rx_id;
+	uint16_t rx_id, nextp_id;
 	uint16_t nb_rx;
 	uint16_t nb_hold;
 	uint16_t data_len;
+	uint16_t prev_id;
+	uint16_t next_id;
 	uint64_t pkt_flags;
+	bool rsc_desc = false;
+	bool eop = false;
 
 	nb_rx = 0;
 	nb_hold = 0;
@@ -1384,12 +1399,11 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	rx_id = rxq->rx_tail;
 	rx_ring = rxq->rx_ring;
 	sw_ring = rxq->sw_ring;
+	prev_id = rxq->prev_id;
 
 	/*
 	 * Retrieve RX context of current packet, if any.
 	 */
-	first_seg = rxq->pkt_first_seg;
-	last_seg = rxq->pkt_last_seg;
 
 	while (nb_rx < nb_pkts) {
 	next_desc:
@@ -1402,9 +1416,11 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		 * using invalid descriptor fields when read from rxd.
 		 */
 		rxdp = &rx_ring[rx_id];
-		staterr = rxdp->wb.upper.status_error;
-		if (! (staterr & rte_cpu_to_le_32(IXGBE_RXDADV_STAT_DD)))
+		staterr = rte_le_to_cpu_32(rxdp->wb.upper.status_error);
+
+		if (!(staterr & IXGBE_RXDADV_STAT_DD))
 			break;
+
 		rxd = *rxdp;
 
 		/*
@@ -1446,21 +1462,23 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 		nb_hold++;
 		rxe = &sw_ring[rx_id];
-		rx_id++;
-		if (rx_id == rxq->nb_rx_desc)
-			rx_id = 0;
+		eop = staterr & IXGBE_RXDADV_STAT_EOP;
+
+		next_id = rx_id + 1;
+		if (next_id == rxq->nb_rx_desc)
+			next_id = 0;
 
 		/* Prefetch next mbuf while processing current one. */
-		rte_ixgbe_prefetch(sw_ring[rx_id].mbuf);
+		rte_ixgbe_prefetch(sw_ring[next_id].mbuf);
 
 		/*
 		 * When next RX descriptor is on a cache-line boundary,
-		 * prefetch the next 4 RX descriptors and the next 8 pointers
+		 * prefetch the next 4 RX descriptors and the next 4 pointers
 		 * to mbufs.
 		 */
-		if ((rx_id & 0x3) == 0) {
-			rte_ixgbe_prefetch(&rx_ring[rx_id]);
-			rte_ixgbe_prefetch(&sw_ring[rx_id]);
+		if ((next_id & 0x3) == 0) {
+			rte_ixgbe_prefetch(&rx_ring[next_id]);
+			rte_ixgbe_prefetch(&sw_ring[next_id]);
 		}
 
 		/*
@@ -1480,6 +1498,34 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		rxm->data_len = data_len;
 		rxm->data_off = RTE_PKTMBUF_HEADROOM;
 
+		if (!eop) {
+			if (rxq->rsc_en)
+				/*
+				 * Check if this descriptor belongs to an RSC
+				 * aggregation.
+				 */
+				rsc_desc = ixgbe_rsc_count(&rxd);
+
+			/*
+			 * Get next descriptor index:
+			 *  - For RSC it's in the NEXTP field.
+			 *  - For a scattered packet - it's just a following
+			 *    descriptor.
+			 */
+			if (rsc_desc)
+				nextp_id =
+					(staterr & IXGBE_RXDADV_NEXTP_MASK) >>
+						       IXGBE_RXDADV_NEXTP_SHIFT;
+			else
+				nextp_id = next_id;
+
+			next_rxe = &sw_ring[nextp_id];
+			rte_ixgbe_prefetch(next_rxe);
+		}
+
+		first_seg = rxe->fbuf;
+		rxe->fbuf = NULL;
+
 		/*
 		 * If this is the first buffer of the received packet,
 		 * set the pointer to the first mbuf of the packet and
@@ -1493,25 +1539,29 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			first_seg->pkt_len = data_len;
 			first_seg->nb_segs = 1;
 		} else {
-			first_seg->pkt_len = (uint16_t)(first_seg->pkt_len
-					+ data_len);
+			first_seg->pkt_len =
+				(uint16_t)(first_seg->pkt_len + data_len);
 			first_seg->nb_segs++;
-			last_seg->next = rxm;
 		}
 
 		/*
 		 * If this is not the last buffer of the received packet,
-		 * update the pointer to the last mbuf of the current scattered
+		 * update the pointer to the first mbuf of the current scattered
 		 * packet and continue to parse the RX ring.
 		 */
-		if (! (staterr & IXGBE_RXDADV_STAT_EOP)) {
-			last_seg = rxm;
+		if (!eop) {
+			rxm->next = next_rxe->mbuf;
+			next_rxe->fbuf = first_seg;
+			prev_id = rx_id;
+			rx_id = next_id;
 			goto next_desc;
 		}
 
 		/*
 		 * This is the last buffer of the received packet.
-		 * If the CRC is not stripped by the hardware:
+		 *
+		 * If the CRC is not stripped by the hardware
+		 * (non-RSC since RSC requires HW CRC Stripping):
 		 *   - Subtract the CRC	length from the total packet length.
 		 *   - If the last buffer only contains the whole CRC or a part
 		 *     of it, free the mbuf associated to the last buffer.
@@ -1522,16 +1572,15 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		rxm->next = NULL;
 		if (unlikely(rxq->crc_len > 0)) {
 			first_seg->pkt_len -= ETHER_CRC_LEN;
+
 			if (data_len <= ETHER_CRC_LEN) {
+				struct rte_mbuf *prev_seg = sw_ring[prev_id].mbuf;
 				rte_pktmbuf_free_seg(rxm);
 				first_seg->nb_segs--;
-				last_seg->data_len = (uint16_t)
-					(last_seg->data_len -
-					 (ETHER_CRC_LEN - data_len));
-				last_seg->next = NULL;
+				prev_seg->data_len -= ETHER_CRC_LEN - data_len;
+				prev_seg->next = NULL;
 			} else
-				rxm->data_len =
-					(uint16_t) (data_len - ETHER_CRC_LEN);
+				rxm->data_len -= ETHER_CRC_LEN;
 		}
 
 		/*
@@ -1577,11 +1626,6 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		 * of returned packets.
 		 */
 		rx_pkts[nb_rx++] = first_seg;
-
-		/*
-		 * Setup receipt context for a new packet.
-		 */
-		first_seg = NULL;
 	}
 
 	/*
@@ -1592,8 +1636,7 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	/*
 	 * Save receive context.
 	 */
-	rxq->pkt_first_seg = first_seg;
-	rxq->pkt_last_seg = last_seg;
+	rxq->prev_id = prev_id;
 
 	/*
 	 * If the number of free RX descriptors is greater than the RX free
@@ -2123,9 +2166,11 @@ ixgbe_reset_rx_queue(struct igb_rx_queue *rxq)
 	rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_thresh - 1);
 #endif /* RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC */
 	rxq->rx_tail = 0;
+	rxq->prev_id = 0;
 	rxq->nb_rx_hold = 0;
 	rxq->pkt_first_seg = NULL;
 	rxq->pkt_last_seg = NULL;
+	rxq->rsc_en = 0;
 }
 
 int
@@ -3612,7 +3657,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	if (dev_info.rx_offload_capa & DEV_RX_OFFLOAD_TCP_LRO)
 		rsc_capable = true;
 
-	if (!rsc_capable && rx_conf->enable_scatter) {
+	if (!rsc_capable && rx_conf->enable_lro) {
 		PMD_INIT_LOG(CRIT, "LRO is requested on HW that doesn't "
 				   "support it");
 		return -EINVAL;
@@ -3643,7 +3688,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	 */
 	if (rsc_capable) {
 		rfctl = IXGBE_READ_REG(hw, IXGBE_RFCTL);
-		if (rx_conf->enable_scatter) {
+		if (rx_conf->enable_lro) {
 			rfctl &= ~(IXGBE_RFCTL_RSC_DIS | IXGBE_RFCTL_NFSW_DIS |
 				   IXGBE_RFCTL_NFSR_DIS);
 		} else {
@@ -3662,7 +3707,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		hlreg0 |= IXGBE_HLREG0_RXCRCSTRP;
 	else {
 		hlreg0 &= ~IXGBE_HLREG0_RXCRCSTRP;
-		if (rx_conf->enable_scatter) {
+		if (rx_conf->enable_lro) {
 			/*
 			 * According to chapter of 4.6.7.2.1 of the Spec Rev.
 			 * 3.0 RSC configuration requires HW CRC stripping being
@@ -3730,7 +3775,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 			 * Print a warning if split_hdr_size is less
 			 * than 128 bytes when RSC is requested.
 			 */
-			if (rx_conf->enable_scatter &&
+			if (rx_conf->enable_lro &&
 			    rx_conf->split_hdr_size < 128)
 				PMD_INIT_LOG(INFO, "split_hdr_size less than "
 						   "128 bytes (%d)!",
@@ -3761,7 +3806,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 			 * the later case we will configure it 128 bytes
 			 * following the recomendation in the spec.
 			 */
-			if (rx_conf->enable_scatter)
+			if (rx_conf->enable_lro)
 				srrctl |=
 				     ((128 << IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
 						    IXGBE_SRRCTL_BSIZEHDR_MASK);
@@ -3782,6 +3827,11 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 				       RTE_PKTMBUF_HEADROOM);
 		srrctl |= ((buf_size >> IXGBE_SRRCTL_BSIZEPKT_SHIFT) &
 			   IXGBE_SRRCTL_BSIZEPKT_MASK);
+
+		/* Set the Receive Descriptor Minimum Threshold Size */
+		//srrctl |= (0x1UL << IXGBE_SRRCTL_RDMTS_SHIFT) &
+		//					IXGBE_SRRCTL_RDMTS_MASK;
+
 		IXGBE_WRITE_REG(hw, IXGBE_SRRCTL(rxq->reg_idx), srrctl);
 
 		buf_size = (uint16_t) ((srrctl & IXGBE_SRRCTL_BSIZEPKT_MASK) <<
@@ -3801,7 +3851,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		}
 
 		/* RSC per-queue configuration */
-		if (rx_conf->enable_scatter) {
+		if (rx_conf->enable_lro) {
 			uint32_t eitr;
 
 			rscctl =
@@ -3821,6 +3871,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 								       psrtype);
 			IXGBE_WRITE_REG(hw, IXGBE_EITR(rxq->reg_idx), eitr);
 
+			rxq->rsc_en = 1;
 		}
 	}
 
@@ -3870,13 +3921,16 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	 * Configure RSC: follow the instructions in the 4.6.7.2.1 of
 	 * the Spec Rev. 3.0.
 	 */
-	if (rx_conf->enable_scatter) {
+	if (rx_conf->enable_lro) {
 		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
 		rdrxctl |= IXGBE_RDRXCTL_RSCACKC;
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
 
 		ixgbe_set_ivar(hw, 0, 0, 0);
 		ixgbe_set_ivar(hw, 1, 0, 0);
+
+		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
+		dev->data->lro = 1;
 	}
 
 
