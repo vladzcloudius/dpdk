@@ -760,7 +760,7 @@ eth_ixgbe_dev_init(__attribute__((unused)) struct eth_driver *eth_drv,
 			                   "Using default TX function.");
 		}
 
-		if (eth_dev->data->scattered_rx)
+		if (eth_dev->data->scattered_rx || eth_dev->data->lro)
 			eth_dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
 		return 0;
 	}
@@ -1641,6 +1641,7 @@ ixgbe_dev_stop(struct rte_eth_dev *dev)
 
 	/* Clear stored conf */
 	dev->data->scattered_rx = 0;
+	dev->data->lro = 0;
 
 	/* Clear recorded link status */
 	memset(&link, 0, sizeof(link));

@@ -76,7 +76,8 @@
  * Structure associated with each descriptor of the RX ring of a RX queue.
  */
 struct igb_rx_entry {
-	struct rte_mbuf *mbuf; /**< mbuf associated with RX descriptor. */
+	struct rte_mbuf *mbuf;     /**< mbuf associated with RX descriptor. */
+	struct rte_mbuf *fbuf;     /**< First segment of the fragmented packet. */
 };
 
 /**
@@ -109,6 +110,7 @@ struct igb_rx_queue {
 	struct rte_mbuf *pkt_last_seg; /**< Last segment of current packet. */
 	uint64_t            mbuf_initializer; /**< value to init mbufs */
 	uint16_t            nb_rx_desc; /**< number of RX descriptors. */
+	uint16_t            prev_id;   /**< Index of the previous descriptor. */
 	uint16_t            rx_tail;  /**< current value of RDT register. */
 	uint16_t            nb_rx_hold; /**< number of held free RX desc. */
 #ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
@@ -126,6 +128,7 @@ struct igb_rx_queue {
 	uint8_t             port_id;  /**< Device port identifier. */
 	uint8_t             crc_len;  /**< 0 if CRC stripped, 4 otherwise. */
 	uint8_t             drop_en;  /**< If not 0, set SRRCTL.Drop_En. */
+	uint8_t             rsc_en;   /**< If not 0, RSC is enabled. */
 	uint8_t             rx_deferred_start; /**< not in global dev start. */
 #ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
 	/** need to alloc dummy mbuf, for wraparound when scanning hw ring */
