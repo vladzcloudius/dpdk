@@ -1032,6 +1032,7 @@ ixgbe_rx_scan_hw_ring(struct igb_rx_queue *rxq)
 	return nb_rx;
 }
 
+/* TODO: This function may and should be used for scattered/LRO flows */
 static inline int
 ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
 {
@@ -1376,16 +1377,64 @@ static inline uint32_t ixgbe_rsc_count(union ixgbe_adv_rx_desc *rx)
 		IXGBE_RXDADV_RSCCNT_MASK) >> IXGBE_RXDADV_RSCCNT_SHIFT;
 }
 
+/**
+ * Initialize the first mbuf of the returned packet:
+ *    - RX port identifier,
+ *    - hardware offload data, if any:
+ *      - RSS flag & hash,
+ *      - IP checksum flag,
+ *      - VLAN TCI, if any,
+ *      - error flags.
+ * @head HEAD of the packet cluster
+ * @desc HW descriptor to get data from
+ * @port_id Port ID of the Rx queue
+ */
+static inline void ixgbe_fill_cluster_head_buf(
+	struct rte_mbuf *head,
+	union ixgbe_adv_rx_desc *desc,
+	uint8_t port_id,
+	uint32_t staterr)
+{
+	uint32_t hlen_type_rss;
+	uint64_t pkt_flags;
+
+	head->port = port_id;
+
+	/*
+	 * The vlan_tci field is only valid when PKT_RX_VLAN_PKT is
+	 * set in the pkt_flags field.
+	 */
+	head->vlan_tci = rte_le_to_cpu_16(desc->wb.upper.vlan);
+	hlen_type_rss = rte_le_to_cpu_32(desc->wb.lower.lo_dword.data);
+	pkt_flags = rx_desc_hlen_type_rss_to_pkt_flags(hlen_type_rss);
+	pkt_flags |= rx_desc_status_to_pkt_flags(staterr);
+	pkt_flags |= rx_desc_error_to_pkt_flags(staterr);
+	head->ol_flags = pkt_flags;
+
+	if (likely(pkt_flags & PKT_RX_RSS_HASH))
+		head->hash.rss = desc->wb.lower.hi_dword.rss;
+	else if (pkt_flags & PKT_RX_FDIR) {
+		head->hash.fdir.hash =
+			(uint16_t)((desc->wb.lower.hi_dword.csum_ip.csum)
+				   & IXGBE_ATR_HASH_MASK);
+		head->hash.fdir.id =
+			desc->wb.lower.hi_dword.csum_ip.ip_id;
+	}
+}
+
 
 uint16_t
-ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
-			  uint16_t nb_pkts)
+ixgbe_recv_scattered_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts,
+			      uint16_t nb_pkts)
 {
 	struct igb_rx_queue *rxq;
 	volatile union ixgbe_adv_rx_desc *rx_ring;
 	volatile union ixgbe_adv_rx_desc *rxdp;
 	struct igb_rx_entry *sw_ring;
+	struct igb_rsc_entry *sw_rsc_ring;
 	struct igb_rx_entry *rxe;
+	struct igb_rsc_entry *rsc_entry;
+	struct igb_rsc_entry *next_rsc_entry = NULL;
 	struct igb_rx_entry *next_rxe = NULL;
 	struct rte_mbuf *first_seg;
 	struct rte_mbuf *rxm;
@@ -1393,15 +1442,11 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	union ixgbe_adv_rx_desc rxd;
 	uint64_t dma; /* Physical address of mbuf data buffer */
 	uint32_t staterr;
-	uint32_t hlen_type_rss;
 	uint16_t rx_id, nextp_id;
 	uint16_t nb_rx;
 	uint16_t nb_hold;
 	uint16_t data_len;
-	uint16_t prev_id;
 	uint16_t next_id;
-	uint64_t pkt_flags;
-	bool rsc_desc = false;
 	bool eop = false;
 
 	nb_rx = 0;
@@ -1410,11 +1455,7 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	rx_id = rxq->rx_tail;
 	rx_ring = rxq->rx_ring;
 	sw_ring = rxq->sw_ring;
-	prev_id = rxq->prev_id;
-
-	/*
-	 * Retrieve RX context of current packet, if any.
-	 */
+	sw_rsc_ring = rxq->sw_rsc_ring;
 
 	while (nb_rx < nb_pkts) {
 	next_desc:
@@ -1437,8 +1478,10 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		/*
 		 * Descriptor done.
 		 *
-		 * Allocate a new mbuf to replenish the RX ring descriptor.
-		 * If the allocation fails:
+		 * TODO: Implement bulk allocation instead.
+		 *
+		 * Allocate a new mbuf to replenish the RX ring descriptor. If
+		 * the allocation fails:
 		 *    - arrange for that RX descriptor to be the first one
 		 *      being parsed the next time the receive function is
 		 *      invoked [on the same queue].
@@ -1510,32 +1553,27 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		rxm->data_off = RTE_PKTMBUF_HEADROOM;
 
 		if (!eop) {
-			if (rxq->rsc_en)
-				/*
-				 * Check if this descriptor belongs to an RSC
-				 * aggregation.
-				 */
-				rsc_desc = ixgbe_rsc_count(&rxd);
-
 			/*
 			 * Get next descriptor index:
 			 *  - For RSC it's in the NEXTP field.
 			 *  - For a scattered packet - it's just a following
 			 *    descriptor.
 			 */
-			if (rsc_desc)
+			if (ixgbe_rsc_count(&rxd))
 				nextp_id =
 					(staterr & IXGBE_RXDADV_NEXTP_MASK) >>
 						       IXGBE_RXDADV_NEXTP_SHIFT;
 			else
 				nextp_id = next_id;
 
+			next_rsc_entry = &sw_rsc_ring[nextp_id];
 			next_rxe = &sw_ring[nextp_id];
 			rte_ixgbe_prefetch(next_rxe);
 		}
 
-		first_seg = rxe->fbuf;
-		rxe->fbuf = NULL;
+		rsc_entry = &sw_rsc_ring[rx_id];
+		first_seg = rsc_entry->fbuf;
+		rsc_entry->fbuf = NULL;
 
 		/*
 		 * If this is the first buffer of the received packet,
@@ -1556,77 +1594,25 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		}
 
 		/*
-		 * If this is not the last buffer of the received packet,
-		 * update the pointer to the first mbuf of the current scattered
-		 * packet and continue to parse the RX ring.
+		 * If this is not the last buffer of the received packet, update
+		 * the pointer to the first mbuf at the NEXTP entry in the
+		 * sw_rsc_ring and continue to parse the RX ring.
 		 */
 		rx_id = next_id;
 		if (!eop) {
 			rxm->next = next_rxe->mbuf;
-			next_rxe->fbuf = first_seg;
-			prev_id = rx_id;
+			next_rsc_entry->fbuf = first_seg;
 			goto next_desc;
 		}
 
 		/*
-		 * This is the last buffer of the received packet.
-		 *
-		 * If the CRC is not stripped by the hardware
-		 * (non-RSC since RSC requires HW CRC Stripping):
-		 *   - Subtract the CRC	length from the total packet length.
-		 *   - If the last buffer only contains the whole CRC or a part
-		 *     of it, free the mbuf associated to the last buffer.
-		 *     If part of the CRC is also contained in the previous
-		 *     mbuf, subtract the length of that CRC part from the
-		 *     data length of the previous mbuf.
+		 * This is the last buffer of the received packet - return
+		 * the current cluster to the user.
 		 */
-		rxm->next = NULL;
-		if (unlikely(rxq->crc_len > 0)) {
-			first_seg->pkt_len -= ETHER_CRC_LEN;
 
-			if (data_len <= ETHER_CRC_LEN) {
-				struct rte_mbuf *prev_seg = sw_ring[prev_id].mbuf;
-				rte_pktmbuf_free_seg(rxm);
-				first_seg->nb_segs--;
-				prev_seg->data_len -= ETHER_CRC_LEN - data_len;
-				prev_seg->next = NULL;
-			} else
-				rxm->data_len -= ETHER_CRC_LEN;
-		}
-
-		/*
-		 * Initialize the first mbuf of the returned packet:
-		 *    - RX port identifier,
-		 *    - hardware offload data, if any:
-		 *      - RSS flag & hash,
-		 *      - IP checksum flag,
-		 *      - VLAN TCI, if any,
-		 *      - error flags.
-		 */
-		first_seg->port = rxq->port_id;
-
-		/*
-		 * The vlan_tci field is only valid when PKT_RX_VLAN_PKT is
-		 * set in the pkt_flags field.
-		 */
-		first_seg->vlan_tci = rte_le_to_cpu_16(rxd.wb.upper.vlan);
-		hlen_type_rss = rte_le_to_cpu_32(rxd.wb.lower.lo_dword.data);
-		pkt_flags = rx_desc_hlen_type_rss_to_pkt_flags(hlen_type_rss);
-		pkt_flags = (pkt_flags |
-				rx_desc_status_to_pkt_flags(staterr));
-		pkt_flags = (pkt_flags |
-				rx_desc_error_to_pkt_flags(staterr));
-		first_seg->ol_flags = pkt_flags;
-
-		if (likely(pkt_flags & PKT_RX_RSS_HASH))
-			first_seg->hash.rss = rxd.wb.lower.hi_dword.rss;
-		else if (pkt_flags & PKT_RX_FDIR) {
-			first_seg->hash.fdir.hash =
-				(uint16_t)((rxd.wb.lower.hi_dword.csum_ip.csum)
-					   & IXGBE_ATR_HASH_MASK);
-			first_seg->hash.fdir.id =
-				rxd.wb.lower.hi_dword.csum_ip.ip_id;
-		}
+		/* Initialize the first mbuf of the returned packet */
+		ixgbe_fill_cluster_head_buf(first_seg, &rxd, rxq->port_id,
+					    staterr);
 
 		/* Prefetch data of first segment, if configured to do so. */
 		rte_packet_prefetch((char *)first_seg->buf_addr +
@@ -1645,9 +1631,237 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	rxq->rx_tail = rx_id;
 
 	/*
+	 * If the number of free RX descriptors is greater than the RX free
+	 * threshold of the queue, advance the Receive Descriptor Tail (RDT)
+	 * register.
+	 * Update the RDT with the value of the last processed RX descriptor
+	 * minus 1, to guarantee that the RDT register is never equal to the
+	 * RDH register, which creates a "full" ring situtation from the
+	 * hardware point of view...
+	 */
+	nb_hold = (uint16_t) (nb_hold + rxq->nb_rx_hold);
+	if (nb_hold > rxq->rx_free_thresh) {
+		PMD_RX_LOG(DEBUG, "port_id=%u queue_id=%u rx_tail=%u "
+			   "nb_hold=%u nb_rx=%u",
+			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
+			   (unsigned) rx_id, (unsigned) nb_hold,
+			   (unsigned) nb_rx);
+		rx_id = (uint16_t) ((rx_id == 0) ?
+				     (rxq->nb_rx_desc - 1) : (rx_id - 1));
+		IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, rx_id);
+		nb_hold = 0;
+	}
+	rxq->nb_rx_hold = nb_hold;
+	return (nb_rx);
+}
+
+uint16_t
+ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
+			  uint16_t nb_pkts)
+{
+	struct igb_rx_queue *rxq;
+	volatile union ixgbe_adv_rx_desc *rx_ring;
+	volatile union ixgbe_adv_rx_desc *rxdp;
+	struct igb_rx_entry *sw_ring;
+	struct igb_rx_entry *rxe;
+	struct rte_mbuf *first_seg;
+	struct rte_mbuf *last_seg;
+	struct rte_mbuf *rxm;
+	struct rte_mbuf *nmb;
+	union ixgbe_adv_rx_desc rxd;
+	uint64_t dma; /* Physical address of mbuf data buffer */
+	uint32_t staterr;
+	uint16_t rx_id;
+	uint16_t nb_rx;
+	uint16_t nb_hold;
+	uint16_t data_len;
+
+	nb_rx = 0;
+	nb_hold = 0;
+	rxq = rx_queue;
+	rx_id = rxq->rx_tail;
+	rx_ring = rxq->rx_ring;
+	sw_ring = rxq->sw_ring;
+
+	/*
+	 * Retrieve RX context of current packet, if any.
+	 */
+	first_seg = rxq->pkt_first_seg;
+	last_seg = rxq->pkt_last_seg;
+
+	while (nb_rx < nb_pkts) {
+	next_desc:
+		/*
+		 * The order of operations here is important as the DD status
+		 * bit must not be read after any other descriptor fields.
+		 * rx_ring and rxdp are pointing to volatile data so the order
+		 * of accesses cannot be reordered by the compiler. If they were
+		 * not volatile, they could be reordered which could lead to
+		 * using invalid descriptor fields when read from rxd.
+		 */
+		rxdp = &rx_ring[rx_id];
+		staterr = rxdp->wb.upper.status_error;
+		if (! (staterr & rte_cpu_to_le_32(IXGBE_RXDADV_STAT_DD)))
+			break;
+		rxd = *rxdp;
+
+		/*
+		 * Descriptor done.
+		 *
+		 * Allocate a new mbuf to replenish the RX ring descriptor.
+		 * If the allocation fails:
+		 *    - arrange for that RX descriptor to be the first one
+		 *      being parsed the next time the receive function is
+		 *      invoked [on the same queue].
+		 *
+		 *    - Stop parsing the RX ring and return immediately.
+		 *
+		 * This policy does not drop the packet received in the RX
+		 * descriptor for which the allocation of a new mbuf failed.
+		 * Thus, it allows that packet to be later retrieved if
+		 * mbuf have been freed in the mean time.
+		 * As a side effect, holding RX descriptors instead of
+		 * systematically giving them back to the NIC may lead to
+		 * RX ring exhaustion situations.
+		 * However, the NIC can gracefully prevent such situations
+		 * to happen by sending specific "back-pressure" flow control
+		 * frames to its peer(s).
+		 */
+		PMD_RX_LOG(DEBUG, "port_id=%u queue_id=%u rx_id=%u "
+			   "staterr=0x%x data_len=%u",
+			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
+			   (unsigned) rx_id, (unsigned) staterr,
+			   (unsigned) rte_le_to_cpu_16(rxd.wb.upper.length));
+
+		nmb = rte_rxmbuf_alloc(rxq->mb_pool);
+		if (nmb == NULL) {
+			PMD_RX_LOG(DEBUG, "RX mbuf alloc failed port_id=%u "
+				   "queue_id=%u", (unsigned) rxq->port_id,
+				   (unsigned) rxq->queue_id);
+			rte_eth_devices[rxq->port_id].data->rx_mbuf_alloc_failed++;
+			break;
+		}
+
+		nb_hold++;
+		rxe = &sw_ring[rx_id];
+		rx_id++;
+		if (rx_id == rxq->nb_rx_desc)
+			rx_id = 0;
+
+		/* Prefetch next mbuf while processing current one. */
+		rte_ixgbe_prefetch(sw_ring[rx_id].mbuf);
+
+		/*
+		 * When next RX descriptor is on a cache-line boundary,
+		 * prefetch the next 4 RX descriptors and the next 8 pointers
+		 * to mbufs.
+		 */
+		if ((rx_id & 0x3) == 0) {
+			rte_ixgbe_prefetch(&rx_ring[rx_id]);
+			rte_ixgbe_prefetch(&sw_ring[rx_id]);
+		}
+
+		/*
+		 * Update RX descriptor with the physical address of the new
+		 * data buffer of the new allocated mbuf.
+		 */
+		rxm = rxe->mbuf;
+		rxe->mbuf = nmb;
+		dma = rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(nmb));
+		rxdp->read.hdr_addr = dma;
+		rxdp->read.pkt_addr = dma;
+
+		/*
+		 * Set data length & data buffer address of mbuf.
+		 */
+		data_len = rte_le_to_cpu_16(rxd.wb.upper.length);
+		rxm->data_len = data_len;
+		rxm->data_off = RTE_PKTMBUF_HEADROOM;
+
+		/*
+		 * If this is the first buffer of the received packet,
+		 * set the pointer to the first mbuf of the packet and
+		 * initialize its context.
+		 * Otherwise, update the total length and the number of segments
+		 * of the current scattered packet, and update the pointer to
+		 * the last mbuf of the current packet.
+		 */
+		if (first_seg == NULL) {
+			first_seg = rxm;
+			first_seg->pkt_len = data_len;
+			first_seg->nb_segs = 1;
+		} else {
+			first_seg->pkt_len = (uint16_t)(first_seg->pkt_len
+					+ data_len);
+			first_seg->nb_segs++;
+			last_seg->next = rxm;
+		}
+
+		/*
+		 * If this is not the last buffer of the received packet,
+		 * update the pointer to the last mbuf of the current scattered
+		 * packet and continue to parse the RX ring.
+		 */
+		if (! (staterr & IXGBE_RXDADV_STAT_EOP)) {
+			last_seg = rxm;
+			goto next_desc;
+		}
+
+		/*
+		 * This is the last buffer of the received packet.
+		 * If the CRC is not stripped by the hardware:
+		 *   - Subtract the CRC	length from the total packet length.
+		 *   - If the last buffer only contains the whole CRC or a part
+		 *     of it, free the mbuf associated to the last buffer.
+		 *     If part of the CRC is also contained in the previous
+		 *     mbuf, subtract the length of that CRC part from the
+		 *     data length of the previous mbuf.
+		 */
+		rxm->next = NULL;
+		if (unlikely(rxq->crc_len > 0)) {
+			first_seg->pkt_len -= ETHER_CRC_LEN;
+			if (data_len <= ETHER_CRC_LEN) {
+				rte_pktmbuf_free_seg(rxm);
+				first_seg->nb_segs--;
+				last_seg->data_len = (uint16_t)
+					(last_seg->data_len -
+					 (ETHER_CRC_LEN - data_len));
+				last_seg->next = NULL;
+			} else
+				rxm->data_len =
+					(uint16_t) (data_len - ETHER_CRC_LEN);
+		}
+
+		/* Initialize the first mbuf of the returned packet */
+		ixgbe_fill_cluster_head_buf(first_seg, &rxd, rxq->port_id,
+					    staterr);
+
+		/* Prefetch data of first segment, if configured to do so. */
+		rte_packet_prefetch((char *)first_seg->buf_addr +
+			first_seg->data_off);
+
+		/*
+		 * Store the mbuf address into the next entry of the array
+		 * of returned packets.
+		 */
+		rx_pkts[nb_rx++] = first_seg;
+
+		/*
+		 * Setup receipt context for a new packet.
+		 */
+		first_seg = NULL;
+	}
+
+	/*
+	 * Record index of the next RX descriptor to probe.
+	 */
+	rxq->rx_tail = rx_id;
+
+	/*
 	 * Save receive context.
 	 */
-	rxq->prev_id = prev_id;
+	rxq->pkt_first_seg = first_seg;
+	rxq->pkt_last_seg = last_seg;
 
 	/*
 	 * If the number of free RX descriptors is greater than the RX free
@@ -2053,6 +2267,7 @@ ixgbe_rx_queue_release(struct igb_rx_queue *rxq)
 	if (rxq != NULL) {
 		ixgbe_rx_queue_release_mbufs(rxq);
 		rte_free(rxq->sw_ring);
+		rte_free(rxq->sw_rsc_ring);
 		rte_free(rxq);
 	}
 }
@@ -2177,7 +2392,6 @@ ixgbe_reset_rx_queue(struct igb_rx_queue *rxq)
 	rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_thresh - 1);
 #endif /* RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC */
 	rxq->rx_tail = 0;
-	rxq->prev_id = 0;
 	rxq->nb_rx_hold = 0;
 	rxq->pkt_first_seg = NULL;
 	rxq->pkt_last_seg = NULL;
@@ -2197,6 +2411,14 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	struct ixgbe_hw     *hw;
 	int use_def_burst_func = 1;
 	uint16_t len;
+	struct rte_eth_dev_info dev_info = { 0 };
+	struct rte_eth_rxmode *dev_rx_mode = &dev->data->dev_conf.rxmode;
+	bool rsc_requested = false;
+
+	dev->dev_ops->dev_infos_get(dev, &dev_info);
+	if ((dev_info.rx_offload_capa & DEV_RX_OFFLOAD_TCP_LRO) &&
+	    dev_rx_mode->enable_lro)
+		rsc_requested = true;
 
 	PMD_INIT_FUNC_TRACE();
 	hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
@@ -2285,15 +2507,33 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 #else
 	len = nb_desc;
 #endif
-	rxq->sw_ring = rte_zmalloc_socket("rxq->sw_ring",
-					  sizeof(struct igb_rx_entry) * len,
-					  RTE_CACHE_LINE_SIZE, socket_id);
-	if (rxq->sw_ring == NULL) {
+	rxq->sw_ring =
+		rte_zmalloc_socket("rxq->sw_ring",
+				   sizeof(struct igb_rx_entry) * len,
+				   RTE_CACHE_LINE_SIZE, socket_id);
+
+	if (!rxq->sw_ring) {
 		ixgbe_rx_queue_release(rxq);
 		return (-ENOMEM);
 	}
-	PMD_INIT_LOG(DEBUG, "sw_ring=%p hw_ring=%p dma_addr=0x%"PRIx64,
-		     rxq->sw_ring, rxq->rx_ring, rxq->rx_ring_phys_addr);
+
+	if (rsc_requested) {
+		rxq->sw_rsc_ring =
+			rte_zmalloc_socket("rxq->sw_rsc_ring",
+					   sizeof(struct igb_rsc_entry) * len,
+					   RTE_CACHE_LINE_SIZE, socket_id);
+		if (!rxq->sw_rsc_ring) {
+			ixgbe_rx_queue_release(rxq);
+			return (-ENOMEM);
+		}
+	} else {
+		rxq->sw_rsc_ring = NULL;
+	}
+
+	PMD_INIT_LOG(DEBUG, "sw_ring=%p sw_rsc_ring=%p hw_ring=%p "
+			    "dma_addr=0x%"PRIx64,
+		     rxq->sw_ring, rxq->sw_rsc_ring, rxq->rx_ring,
+		     rxq->rx_ring_phys_addr);
 
 	/*
 	 * Certain constraints must be met in order to use the bulk buffer
@@ -3943,7 +4183,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 		PMD_INIT_LOG(INFO, "enabling LRO mode");
 
-		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
+		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_lro;
 		dev->data->lro = 1;
 	}
 

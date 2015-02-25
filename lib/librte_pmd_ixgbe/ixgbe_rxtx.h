@@ -77,7 +77,10 @@
  */
 struct igb_rx_entry {
 	struct rte_mbuf *mbuf;     /**< mbuf associated with RX descriptor. */
-	struct rte_mbuf *fbuf;     /**< First segment of the fragmented packet. */
+};
+
+struct igb_rsc_entry {
+	struct rte_mbuf *fbuf;   /**< First segment of the fragmented packet. */
 };
 
 /**
@@ -106,11 +109,11 @@ struct igb_rx_queue {
 	volatile uint32_t   *rdt_reg_addr; /**< RDT register address. */
 	volatile uint32_t   *rdh_reg_addr; /**< RDH register address. */
 	struct igb_rx_entry *sw_ring; /**< address of RX software ring. */
+	struct igb_rsc_entry *sw_rsc_ring; /**< address of RSC software ring. */
 	struct rte_mbuf *pkt_first_seg; /**< First segment of current packet. */
 	struct rte_mbuf *pkt_last_seg; /**< Last segment of current packet. */
 	uint64_t            mbuf_initializer; /**< value to init mbufs */
 	uint16_t            nb_rx_desc; /**< number of RX descriptors. */
-	uint16_t            prev_id;   /**< Index of the previous descriptor. */
 	uint16_t            rx_tail;  /**< current value of RDT register. */
 	uint16_t            nb_rx_hold; /**< number of held free RX desc. */
 #ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC

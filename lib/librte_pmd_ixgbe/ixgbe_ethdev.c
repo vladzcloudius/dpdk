@@ -760,8 +760,12 @@ eth_ixgbe_dev_init(__attribute__((unused)) struct eth_driver *eth_drv,
 			                   "Using default TX function.");
 		}
 
-		if (eth_dev->data->scattered_rx || eth_dev->data->lro)
+		if (eth_dev->data->scattered_rx)
 			eth_dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
+
+		if (eth_dev->data->lro)
+			eth_dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_lro;
+
 		return 0;
 	}
 	pci_dev = eth_dev->pci_dev;
