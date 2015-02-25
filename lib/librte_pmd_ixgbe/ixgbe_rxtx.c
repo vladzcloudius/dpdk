@@ -1598,6 +1598,7 @@ ixgbe_recv_scattered_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts,
 		 * This is the last buffer of the received packet - return
 		 * the current cluster to the user.
 		 */
+		rxm->next = NULL;
 
 		/* Initialize the first mbuf of the returned packet */
 		ixgbe_fill_cluster_head_buf(first_seg, &rxd, rxq->port_id,
