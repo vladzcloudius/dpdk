@@ -1032,8 +1032,7 @@ ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq, bool reset_mbuf)
 	int diag, i;
 
 	/* allocate buffers in bulk directly into the S/W ring */
-	alloc_idx = (uint16_t)(rxq->rx_free_trigger -
-				(rxq->rx_free_thresh - 1));
+	alloc_idx = rxq->rx_free_trigger - (rxq->rx_free_thresh - 1);
 	rxep = &rxq->sw_ring[alloc_idx];
 	diag = rte_mempool_get_bulk(rxq->mb_pool, (void *)rxep,
 				    rxq->rx_free_thresh);
@@ -1059,15 +1058,10 @@ ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq, bool reset_mbuf)
 		rxdp[i].read.pkt_addr = dma_addr;
 	}
 
-	/* update tail pointer */
-	rte_wmb();
-	IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, rxq->rx_free_trigger);
-
 	/* update state of internal queue structure */
-	rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_trigger +
-						rxq->rx_free_thresh);
+	rxq->rx_free_trigger = rxq->rx_free_trigger + rxq->rx_free_thresh;
 	if (rxq->rx_free_trigger >= rxq->nb_rx_desc)
-		rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_thresh - 1);
+		rxq->rx_free_trigger = rxq->rx_free_thresh - 1;
 
 	/* no errors */
 	return 0;
@@ -1115,6 +1109,8 @@ rx_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 	/* if required, allocate new buffers to replenish descriptors */
 	if (rxq->rx_tail > rxq->rx_free_trigger) {
+		uint16_t cur_free_trigger = rxq->rx_free_trigger;
+
 		if (ixgbe_rx_alloc_bufs(rxq, true) != 0) {
 			int i, j;
 			PMD_RX_LOG(DEBUG, "RX mbuf alloc failed port_id=%u "
@@ -1135,6 +1131,10 @@ rx_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 			return 0;
 		}
+
+		/* update tail pointer */
+		rte_wmb();
+		IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, cur_free_trigger);
 	}
 
 	if (rxq->rx_tail >= rxq->nb_rx_desc)
@@ -1422,9 +1422,9 @@ _recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 	volatile union ixgbe_adv_rx_desc *rx_ring = rxq->rx_ring;
 	struct igb_rx_entry *sw_ring = rxq->sw_ring;
 	struct igb_rsc_entry *sw_rsc_ring = rxq->sw_rsc_ring;
-	uint16_t rx_id = rxq->rx_tail, nextp_id;
+	uint16_t rx_id = rxq->rx_tail;
 	uint16_t nb_rx = 0;
-	uint16_t nb_hold = 0;
+	uint16_t nb_hold = rxq->nb_rx_hold;
 	uint16_t prev_id = rxq->rx_tail;
 
 	while (nb_rx < nb_pkts) {
@@ -1468,6 +1468,20 @@ _recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 			nmb = rte_rxmbuf_alloc(rxq->mb_pool);
 			if (nmb == NULL) {
 				PMD_RX_LOG(DEBUG, "RX mbuf alloc failed "
+						  "port_id=%u queue_id=%u",
+					   rxq->port_id, rxq->queue_id);
+
+				rte_eth_devices[rxq->port_id].data->
+							rx_mbuf_alloc_failed++;
+				break;
+			}
+		} else if (nb_hold > rxq->rx_free_thresh) {
+			if (!ixgbe_rx_alloc_bufs(rxq, false)) {
+				rte_wmb();
+				IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
+				nb_hold -= rxq->rx_free_thresh;
+			} else {
+				PMD_RX_LOG(DEBUG, "RX bulk alloc failed "
 						  "port_id=%u queue_id=%u",
 					   rxq->port_id, rxq->queue_id);
 
@@ -1520,6 +1534,7 @@ _recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 		rxm->data_len = data_len;
 
 		if (!eop) {
+			uint16_t nextp_id;
 			/*
 			 * Get next descriptor index:
 			 *  - For RSC it's in the NEXTP field.
@@ -1609,23 +1624,15 @@ _recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 	 * RDH register, which creates a "full" ring situtation from the
 	 * hardware point of view...
 	 */
-	nb_hold += rxq->nb_rx_hold;
-	if (nb_hold > rxq->rx_free_thresh) {
+	if (!bulk_alloc && nb_hold > rxq->rx_free_thresh) {
 		PMD_RX_LOG(DEBUG, "port_id=%u queue_id=%u rx_tail=%u "
 			   "nb_hold=%u nb_rx=%u",
 			   rxq->port_id, rxq->queue_id, rx_id, nb_hold, nb_rx);
 
-		if (bulk_alloc) {
-			/* Update RDT only if the allocation was successfull */
-			if (!ixgbe_rx_alloc_bufs(rxq, false)) {
-				IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
-				nb_hold = 0;
-			}
-		} else {
-			IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
-			nb_hold = 0;
-		}
+		IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
+		nb_hold = 0;
 	}
+
 	rxq->nb_rx_hold = nb_hold;
 	return nb_rx;
 }
