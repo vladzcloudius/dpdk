@@ -763,8 +763,12 @@ eth_ixgbe_dev_init(__attribute__((unused)) struct eth_driver *eth_drv,
 		if (eth_dev->data->scattered_rx)
 			eth_dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
 
-		if (eth_dev->data->lro)
-			eth_dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_lro;
+		if (eth_dev->data->lro) {
+			if (eth_dev->data->lro_bulk_alloc)
+				eth_dev->rx_pkt_burst = ixgbe_recv_pkts_lro_bulk_alloc;
+			else
+				eth_dev->rx_pkt_burst = ixgbe_recv_pkts_lro;
+		}
 
 		return 0;
 	}
@@ -1646,6 +1650,7 @@ ixgbe_dev_stop(struct rte_eth_dev *dev)
 	/* Clear stored conf */
 	dev->data->scattered_rx = 0;
 	dev->data->lro = 0;
+	dev->data->lro_bulk_alloc = 0;
 
 	/* Clear recorded link status */
 	memset(&link, 0, sizeof(link));
