@@ -1032,9 +1032,8 @@ ixgbe_rx_scan_hw_ring(struct igb_rx_queue *rxq)
 	return nb_rx;
 }
 
-/* TODO: This function may and should be used for scattered/LRO flows */
 static inline int
-ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
+ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq, bool reset_mbuf)
 {
 	volatile union ixgbe_adv_rx_desc *rxdp;
 	struct igb_rx_entry *rxep;
@@ -1056,11 +1055,14 @@ ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
 	for (i = 0; i < rxq->rx_free_thresh; ++i) {
 		/* populate the static rte mbuf fields */
 		mb = rxep[i].mbuf;
-		rte_mbuf_refcnt_set(mb, 1);
-		mb->next = NULL;
+		if (reset_mbuf) {
+			rte_mbuf_refcnt_set(mb, 1);
+			mb->next = NULL;
+			mb->nb_segs = 1;
+			mb->port = rxq->port_id;
+		}
+
 		mb->data_off = RTE_PKTMBUF_HEADROOM;
-		mb->nb_segs = 1;
-		mb->port = rxq->port_id;
 
 		/* populate the descriptors */
 		dma_addr = (uint64_t)mb->buf_physaddr + RTE_PKTMBUF_HEADROOM;
@@ -1124,7 +1126,7 @@ rx_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 	/* if required, allocate new buffers to replenish descriptors */
 	if (rxq->rx_tail > rxq->rx_free_trigger) {
-		if (ixgbe_rx_alloc_bufs(rxq) != 0) {
+		if (ixgbe_rx_alloc_bufs(rxq, true) != 0) {
 			int i, j;
 			PMD_RX_LOG(DEBUG, "RX mbuf alloc failed port_id=%u "
 				   "queue_id=%u", (unsigned) rxq->port_id,
@@ -1423,41 +1425,34 @@ static inline void ixgbe_fill_cluster_head_buf(
 }
 
 
-uint16_t
-ixgbe_recv_scattered_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts,
-			      uint16_t nb_pkts)
+static inline uint16_t
+_recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
+	       bool bulk_alloc)
 {
-	struct igb_rx_queue *rxq;
-	volatile union ixgbe_adv_rx_desc *rx_ring;
-	volatile union ixgbe_adv_rx_desc *rxdp;
-	struct igb_rx_entry *sw_ring;
-	struct igb_rsc_entry *sw_rsc_ring;
-	struct igb_rx_entry *rxe;
-	struct igb_rsc_entry *rsc_entry;
-	struct igb_rsc_entry *next_rsc_entry = NULL;
-	struct igb_rx_entry *next_rxe = NULL;
-	struct rte_mbuf *first_seg;
-	struct rte_mbuf *rxm;
-	struct rte_mbuf *nmb;
-	union ixgbe_adv_rx_desc rxd;
-	uint64_t dma; /* Physical address of mbuf data buffer */
-	uint32_t staterr;
-	uint16_t rx_id, nextp_id;
-	uint16_t nb_rx;
-	uint16_t nb_hold;
-	uint16_t data_len;
-	uint16_t next_id;
-	bool eop = false;
-
-	nb_rx = 0;
-	nb_hold = 0;
-	rxq = rx_queue;
-	rx_id = rxq->rx_tail;
-	rx_ring = rxq->rx_ring;
-	sw_ring = rxq->sw_ring;
-	sw_rsc_ring = rxq->sw_rsc_ring;
+	struct igb_rx_queue *rxq = rx_queue;
+	volatile union ixgbe_adv_rx_desc *rx_ring = rxq->rx_ring;
+	struct igb_rx_entry *sw_ring = rxq->sw_ring;
+	struct igb_rsc_entry *sw_rsc_ring = rxq->sw_rsc_ring;
+	uint16_t rx_id = rxq->rx_tail, nextp_id;
+	uint16_t nb_rx = 0;
+	uint16_t nb_hold = 0;
+	uint16_t prev_id = rxq->rx_tail;
 
 	while (nb_rx < nb_pkts) {
+		bool eop;
+		struct igb_rx_entry *rxe;
+		struct igb_rsc_entry *rsc_entry;
+		struct igb_rsc_entry *next_rsc_entry;
+		struct igb_rx_entry *next_rxe;
+		struct rte_mbuf *first_seg;
+		struct rte_mbuf *rxm;
+		struct rte_mbuf *nmb;
+		union ixgbe_adv_rx_desc rxd;
+		uint16_t data_len;
+		uint16_t next_id;
+		volatile union ixgbe_adv_rx_desc *rxdp;
+		uint32_t staterr;
+
 	next_desc:
 		/*
 		 * The order of operations here is important as the DD status
@@ -1475,43 +1470,22 @@ ixgbe_recv_scattered_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 		rxd = *rxdp;
 
-		/*
-		 * Descriptor done.
-		 *
-		 * TODO: Implement bulk allocation instead.
-		 *
-		 * Allocate a new mbuf to replenish the RX ring descriptor. If
-		 * the allocation fails:
-		 *    - arrange for that RX descriptor to be the first one
-		 *      being parsed the next time the receive function is
-		 *      invoked [on the same queue].
-		 *
-		 *    - Stop parsing the RX ring and return immediately.
-		 *
-		 * This policy does not drop the packet received in the RX
-		 * descriptor for which the allocation of a new mbuf failed.
-		 * Thus, it allows that packet to be later retrieved if
-		 * mbuf have been freed in the mean time.
-		 * As a side effect, holding RX descriptors instead of
-		 * systematically giving them back to the NIC may lead to
-		 * RX ring exhaustion situations.
-		 * However, the NIC can gracefully prevent such situations
-		 * to happen by sending specific "back-pressure" flow control
-		 * frames to its peer(s).
-		 */
 		PMD_RX_LOG(DEBUG, "port_id=%u queue_id=%u rx_id=%u "
-			   "staterr=0x%x data_len=%u",
-			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
-			   (unsigned) rx_id, (unsigned) staterr,
-			   (unsigned) rte_le_to_cpu_16(rxd.wb.upper.length));
+				  "staterr=0x%x data_len=%u",
+			   rxq->port_id, rxq->queue_id, rx_id, staterr,
+			   rte_le_to_cpu_16(rxd.wb.upper.length));
 
-		nmb = rte_rxmbuf_alloc(rxq->mb_pool);
-		if (nmb == NULL) {
-			PMD_RX_LOG(DEBUG, "RX mbuf alloc failed port_id=%u "
-				   "queue_id=%u", (unsigned) rxq->port_id,
-				   (unsigned) rxq->queue_id);
-			rte_eth_devices[rxq->port_id].data->rx_mbuf_alloc_failed++;
-			break;
+		if (!bulk_alloc) {
+			nmb = rte_rxmbuf_alloc(rxq->mb_pool);
+			if (nmb == NULL) {
+				PMD_RX_LOG(DEBUG, "RX mbuf alloc failed "
+						  "port_id=%u queue_id=%u",
+					   rxq->port_id, rxq->queue_id);
+
+				rte_eth_devices[rxq->port_id].data->
+							rx_mbuf_alloc_failed++;
+				break;
+			}
 		}
 
 		nb_hold++;
@@ -1535,22 +1509,26 @@ ixgbe_recv_scattered_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts,
 			rte_ixgbe_prefetch(&sw_ring[next_id]);
 		}
 
-		/*
-		 * Update RX descriptor with the physical address of the new
-		 * data buffer of the new allocated mbuf.
-		 */
 		rxm = rxe->mbuf;
-		rxe->mbuf = nmb;
-		dma = rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(nmb));
-		rxdp->read.hdr_addr = dma;
-		rxdp->read.pkt_addr = dma;
 
+		if (!bulk_alloc) {
+			uint64_t dma =
+			  rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(nmb));
+			/*
+			 * Update RX descriptor with the physical address of the
+			 * new data buffer of the new allocated mbuf.
+			 */
+			rxe->mbuf = nmb;
+                        
+                        rxm->data_off = RTE_PKTMBUF_HEADROOM;
+			rxdp->read.hdr_addr = dma;
+			rxdp->read.pkt_addr = dma;
+		}
 		/*
 		 * Set data length & data buffer address of mbuf.
 		 */
 		data_len = rte_le_to_cpu_16(rxd.wb.upper.length);
 		rxm->data_len = data_len;
-		rxm->data_off = RTE_PKTMBUF_HEADROOM;
 
 		if (!eop) {
 			/*
@@ -1593,12 +1571,14 @@ ixgbe_recv_scattered_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts,
 			first_seg->nb_segs++;
 		}
 
+		prev_id = rx_id;
+		rx_id = next_id;
+
 		/*
 		 * If this is not the last buffer of the received packet, update
 		 * the pointer to the first mbuf at the NEXTP entry in the
 		 * sw_rsc_ring and continue to parse the RX ring.
 		 */
-		rx_id = next_id;
 		if (!eop) {
 			rxm->next = next_rxe->mbuf;
 			next_rsc_entry->fbuf = first_seg;
@@ -1640,20 +1620,38 @@ ixgbe_recv_scattered_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts,
 	 * RDH register, which creates a "full" ring situtation from the
 	 * hardware point of view...
 	 */
-	nb_hold = (uint16_t) (nb_hold + rxq->nb_rx_hold);
+	nb_hold += rxq->nb_rx_hold;
 	if (nb_hold > rxq->rx_free_thresh) {
 		PMD_RX_LOG(DEBUG, "port_id=%u queue_id=%u rx_tail=%u "
 			   "nb_hold=%u nb_rx=%u",
-			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
-			   (unsigned) rx_id, (unsigned) nb_hold,
-			   (unsigned) nb_rx);
-		rx_id = (uint16_t) ((rx_id == 0) ?
-				     (rxq->nb_rx_desc - 1) : (rx_id - 1));
-		IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, rx_id);
-		nb_hold = 0;
+			   rxq->port_id, rxq->queue_id, rx_id, nb_hold, nb_rx);
+
+		if (bulk_alloc) {
+			/* Update RDT only if the allocation was successfull */
+			if (!ixgbe_rx_alloc_bufs(rxq, false)) {
+				IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
+				nb_hold = 0;
+			}
+		} else {
+			IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
+			nb_hold = 0;
+		}
 	}
 	rxq->nb_rx_hold = nb_hold;
-	return (nb_rx);
+	return nb_rx;
+}
+
+uint16_t
+ixgbe_recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts)
+{
+	return _recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, false);
+}
+
+uint16_t
+ixgbe_recv_pkts_lro_bulk_alloc(void *rx_queue, struct rte_mbuf **rx_pkts,
+			       uint16_t nb_pkts)
+{
+	return _recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, true);
 }
 
 uint16_t
@@ -2545,9 +2543,14 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 #ifdef RTE_IXGBE_INC_VECTOR
 	ixgbe_rxq_vec_setup(rxq);
 #endif
+	/*
+	 * TODO: This must be moved to ixgbe_dev_rx_init() since rx_pkt_burst
+	 * is a global per-device callback thus bulk allocation may be used
+	 * only if all queues meet the above preconditions.
+	 */
+
 	/* Check if pre-conditions are satisfied, and no Scattered Rx */
-	if (!use_def_burst_func && !dev->data->scattered_rx &&
-	    !dev->data->lro) {
+	if (!use_def_burst_func && !dev->data->scattered_rx) {
 #ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
 		PMD_INIT_LOG(DEBUG, "Rx Burst Bulk Alloc Preconditions are "
 			     "satisfied. Rx Burst Bulk Alloc function will be "
@@ -2569,6 +2572,7 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 			     "enabled (port=%d, queue=%d).",
 			     rxq->port_id, rxq->queue_id);
 	}
+
 	dev->data->rx_queues[queue_idx] = rxq;
 
 	ixgbe_reset_rx_queue(rxq);
@@ -3904,6 +3908,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	struct rte_eth_rxmode *rx_conf = &dev->data->dev_conf.rxmode;
 	struct rte_eth_dev_info dev_info = { 0 };
 	bool rsc_capable = false;
+	int bulk_alloc_cond = 0;
 
 	/* Sanity check */
 	dev->dev_ops->dev_infos_get(dev, &dev_info);
@@ -4126,6 +4131,12 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 			rxq->rsc_en = 1;
 		}
+
+		/*
+		 * We may use bulk allocation only all queues satisfy the
+		 * preconditions.
+		 */
+		bulk_alloc_cond |= check_rx_burst_bulk_alloc_preconditions(rxq);
 	}
 
 	if (rx_conf->enable_scatter) {
@@ -4170,11 +4181,11 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
 	}
 
-	/*
-	 * Configure RSC: follow the instructions in the 4.6.7.2.1 of
-	 * the Spec Rev. 3.0.
-	 */
+	/* Finalize RSC configuration  */
 	if (rx_conf->enable_lro) {
+		/*
+		 * Follow the instructions in the 4.6.7.2.1 of the Spec Rev. 3.0
+		 */
 		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
 		rdrxctl |= IXGBE_RDRXCTL_RSCACKC;
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
@@ -4184,8 +4195,23 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 		PMD_INIT_LOG(INFO, "enabling LRO mode");
 
-		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_lro;
 		dev->data->lro = 1;
+		/*
+		 * Initialize the appropriate LRO callback. If all queues
+		 * satisfy the bulk allocation preconditions (bulk_alloc_cond
+		 * is zero) then we may use bulk allocation. Otherwise use a
+		 * single allocation version.
+		 */
+		if (!bulk_alloc_cond) {
+			PMD_INIT_LOG(INFO, "LRO is requested. Using a bulk "
+					   "allocation version");
+			dev->rx_pkt_burst = ixgbe_recv_pkts_lro_bulk_alloc;
+			dev->data->lro_bulk_alloc = 1;
+		} else {
+			PMD_INIT_LOG(INFO, "LRO is requested. Using a single "
+					   "allocation version");
+			dev->rx_pkt_burst = ixgbe_recv_pkts_lro;
+		}
 	}
 
 
