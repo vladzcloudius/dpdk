@@ -1174,6 +1174,13 @@ ixgbe_recv_pkts_bulk_alloc(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 	return nb_rx;
 }
+#else
+static inline int
+ixgbe_rx_alloc_bufs(__rte_unused struct igb_rx_queue *rxq,
+		    __rte_unused bool reset_mbuf)
+{
+	return -ENOMEM;
+}
 #endif /* RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC */
 
 uint16_t
