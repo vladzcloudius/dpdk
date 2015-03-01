@@ -1476,28 +1476,29 @@ _recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 	next_desc:
 		/*
 		 * The code in this whole file uses the volatile pointer to
-		 * ensure the read ordering (on the compiler level only!!!) of
-		 * the status and the rest of the descriptor fields! This is
-		 * so UGLY - why not to just use the compiler barrier instead?
-		 * DPDK even has the rte_compiler_barrier() for that.
+		 * ensure the read ordering of the status and the rest of the
+		 * descriptor fields (on the compiler level only!!!). This is so
+		 * UGLY - why not to just use the compiler barrier instead? DPDK
+		 * even has the rte_compiler_barrier() for that.
 		 *
 		 * But most importantly this is just wrong because this doesn't
 		 * ensure memory ordering in a general case at all. For
-		 * instance, DPDK is supposed to work on Power CPUs when
-		 * compiler barrier may not be enough!
+		 * instance, DPDK is supposed to work on Power CPUs where
+		 * compiler barrier may just not be enough!
 		 *
-		 * I tried to write only this function right for a starters as a
-		 * part of an LRO/RSC patch but the compiler cursed at me when I
-		 * tried to cast away the "volatile" from rx_ring (yes, it's
-		 * volatile too!!!). So, I'm keeping it the way it is now.
+		 * I tried to write only this function properly to have a
+		 * starting point (as a part of an LRO/RSC series) but the
+		 * compiler cursed at me when I tried to cast away the
+		 * "volatile" from rx_ring (yes, it's volatile too!!!). So, I'm
+		 * keeping it the way it is for now.
 		 *
 		 * The code in this file is broken in so many other places and
 		 * will just not work on a big endian CPU anyway therefore the
-		 * lines below will have to be revisited anyway together with
-		 * the rest of the ixgbe PMD.
+		 * lines below will have to be revisited together with the rest
+		 * of the ixgbe PMD.
 		 *
 		 * TODO:
-		 *    - Get rid of volatile crap and let the compiler to its
+		 *    - Get rid of "volatile" crap and let the compiler do its
 		 *      job.
 		 *    - Use the proper memory barrier (rte_rmb()) to ensure the
 		 *      memory ordering below.
@@ -3855,7 +3856,7 @@ ixgbe_dev_mq_tx_configure(struct rte_eth_dev *dev)
 }
 
 /**
- * get_rscctl_maxdesc_82599EB - Calculate the RSCCTL[n].MAXDESC for 82599 PF
+ * get_rscctl_maxdesc - Calculate the RSCCTL[n].MAXDESC for PF
  *
  * Return the RSCCTL[n].MAXDESC for 82599 and x540 PF devices according to the
  * spec rev. 3.0 chapter 8.2.3.8.13.
@@ -3880,56 +3881,56 @@ static inline uint32_t get_rscctl_maxdesc(struct rte_mempool *pool)
 		return IXGBE_RSCCTL_MAXDESC_1;
 }
 
-/**
- * ixgbe_set_ivar - set the IVAR registers, mapping interrupt causes to vectors
- * @adapter: pointer to adapter struct
- * @direction: 0 for Rx, 1 for Tx, -1 for other causes
- * @queue: queue to map the corresponding interrupt to
- * @msix_vector: the vector to map to the corresponding queue
- *
- */
-static void ixgbe_set_ivar(struct ixgbe_hw *hw, int8_t direction,
-			   uint8_t queue, uint8_t msix_vector)
+/* (Taken frme FreeBSD tree)
+** Setup the correct IVAR register for a particular MSIX interrupt
+**   (yes this is all very magic and confusing :)
+**  - entry is the register array entry
+**  - vector is the MSIX vector for this queue
+**  - type is RX/TX/MISC
+*/
+static void
+ixgbe_set_ivar(struct rte_eth_dev *dev, u8 entry, u8 vector, s8 type)
 {
+	struct ixgbe_hw *hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
 	u32 ivar, index;
+
+	vector |= IXGBE_IVAR_ALLOC_VAL;
+
 	switch (hw->mac.type) {
+
 	case ixgbe_mac_82598EB:
-		msix_vector |= IXGBE_IVAR_ALLOC_VAL;
-		if (direction == -1)
-			direction = 0;
-		index = (((direction * 64) + queue) >> 2) & 0x1F;
+		if (type == -1)
+			entry = IXGBE_IVAR_OTHER_CAUSES_INDEX;
+		else
+			entry += (type * 64);
+		index = (entry >> 2) & 0x1F;
 		ivar = IXGBE_READ_REG(hw, IXGBE_IVAR(index));
-		ivar &= ~(0xFF << (8 * (queue & 0x3)));
-		ivar |= (msix_vector << (8 * (queue & 0x3)));
+		ivar &= ~(0xFF << (8 * (entry & 0x3)));
+		ivar |= (vector << (8 * (entry & 0x3)));
 		IXGBE_WRITE_REG(hw, IXGBE_IVAR(index), ivar);
 		break;
+
 	case ixgbe_mac_82599EB:
 	case ixgbe_mac_X540:
-	case ixgbe_mac_X550:
-	case ixgbe_mac_X550EM_x:
-		if (direction == -1) {
-			/* other causes */
-			msix_vector |= IXGBE_IVAR_ALLOC_VAL;
-			index = ((queue & 1) * 8);
+		if (type == -1) { /* MISC IVAR */
+			index = (entry & 1) * 8;
 			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR_MISC);
 			ivar &= ~(0xFF << index);
-			ivar |= (msix_vector << index);
+			ivar |= (vector << index);
 			IXGBE_WRITE_REG(hw, IXGBE_IVAR_MISC, ivar);
-			break;
-		} else {
-			/* tx or rx causes */
-			msix_vector |= IXGBE_IVAR_ALLOC_VAL;
-			index = ((16 * (queue & 1)) + (8 * direction));
-			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR(queue >> 1));
+		} else {	/* RX/TX IVARS */
+			index = (16 * (entry & 1)) + (8 * type);
+			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR(entry >> 1));
 			ivar &= ~(0xFF << index);
-			ivar |= (msix_vector << index);
-			IXGBE_WRITE_REG(hw, IXGBE_IVAR(queue >> 1), ivar);
-			break;
+			ivar |= (vector << index);
+			IXGBE_WRITE_REG(hw, IXGBE_IVAR(entry >> 1), ivar);
 		}
+
 	default:
 		break;
 	}
 }
+
 
 /*
  * Initializes Receive Unit.
@@ -4177,6 +4178,12 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 								       psrtype);
 			IXGBE_WRITE_REG(hw, IXGBE_EITR(rxq->reg_idx), eitr);
 
+			/*
+			 * RSC requires the mapping on the queue to the
+			 * interrupt vector.
+			 */
+			ixgbe_set_ivar(dev, rxq->reg_idx, i, 0);
+
 			rxq->rsc_en = 1;
 		}
 
@@ -4237,9 +4244,6 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
 		rdrxctl |= IXGBE_RDRXCTL_RSCACKC;
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
-
-		ixgbe_set_ivar(hw, 0, 0, 0);
-		ixgbe_set_ivar(hw, 1, 0, 0);
 
 		PMD_INIT_LOG(INFO, "enabling LRO mode");
 
