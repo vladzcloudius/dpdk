@@ -1028,12 +1028,11 @@ ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
 	struct igb_rx_entry *rxep;
 	struct rte_mbuf *mb;
 	uint16_t alloc_idx;
-	uint64_t dma_addr;
+	__le64 dma_addr;
 	int diag, i;
 
 	/* allocate buffers in bulk directly into the S/W ring */
-	alloc_idx = (uint16_t)(rxq->rx_free_trigger -
-				(rxq->rx_free_thresh - 1));
+	alloc_idx = rxq->rx_free_trigger - (rxq->rx_free_thresh - 1);
 	rxep = &rxq->sw_ring[alloc_idx];
 	diag = rte_mempool_get_bulk(rxq->mb_pool, (void *)rxep,
 				    rxq->rx_free_thresh);
@@ -1051,7 +1050,7 @@ ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
 		mb->port = rxq->port_id;
 
 		/* populate the descriptors */
-		dma_addr = (uint64_t)mb->buf_physaddr + RTE_PKTMBUF_HEADROOM;
+		dma_addr = rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(mb));
 		rxdp[i].read.hdr_addr = dma_addr;
 		rxdp[i].read.pkt_addr = dma_addr;
 	}
@@ -1061,10 +1060,9 @@ ixgbe_rx_alloc_bufs(struct igb_rx_queue *rxq)
 	IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, rxq->rx_free_trigger);
 
 	/* update state of internal queue structure */
-	rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_trigger +
-						rxq->rx_free_thresh);
+	rxq->rx_free_trigger = rxq->rx_free_trigger + rxq->rx_free_thresh;
 	if (rxq->rx_free_trigger >= rxq->nb_rx_desc)
-		rxq->rx_free_trigger = (uint16_t)(rxq->rx_free_thresh - 1);
+		rxq->rx_free_trigger = rxq->rx_free_thresh - 1;
 
 	/* no errors */
 	return 0;
@@ -1559,13 +1557,14 @@ ixgbe_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		first_seg->ol_flags = pkt_flags;
 
 		if (likely(pkt_flags & PKT_RX_RSS_HASH))
-			first_seg->hash.rss = rxd.wb.lower.hi_dword.rss;
+			first_seg->hash.rss =
+				    rte_le_to_cpu_32(rxd.wb.lower.hi_dword.rss);
 		else if (pkt_flags & PKT_RX_FDIR) {
 			first_seg->hash.fdir.hash =
-				(uint16_t)((rxd.wb.lower.hi_dword.csum_ip.csum)
-					   & IXGBE_ATR_HASH_MASK);
+			    rte_le_to_cpu_16(rxd.wb.lower.hi_dword.csum_ip.csum)
+					   & IXGBE_ATR_HASH_MASK;
 			first_seg->hash.fdir.id =
-				rxd.wb.lower.hi_dword.csum_ip.ip_id;
+			  rte_le_to_cpu_16(rxd.wb.lower.hi_dword.csum_ip.ip_id);
 		}
 
 		/* Prefetch data of first segment, if configured to do so. */
@@ -2248,6 +2247,12 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 #ifdef RTE_IXGBE_INC_VECTOR
 	ixgbe_rxq_vec_setup(rxq);
 #endif
+	/*
+	 * TODO: This must be moved to ixgbe_dev_rx_init() since rx_pkt_burst
+	 * is a global per-device callback thus bulk allocation may be used
+	 * only if all queues meet the above preconditions.
+	 */
+
 	/* Check if pre-conditions are satisfied, and no Scattered Rx */
 	if (!use_def_burst_func && !dev->data->scattered_rx) {
 #ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
@@ -3524,6 +3529,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	uint32_t rxcsum;
 	uint16_t buf_size;
 	uint16_t i;
+	struct rte_eth_rxmode *rx_conf = &dev->data->dev_conf.rxmode;
 
 	PMD_INIT_FUNC_TRACE();
 	hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
@@ -3546,7 +3552,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	 * Configure CRC stripping, if any.
 	 */
 	hlreg0 = IXGBE_READ_REG(hw, IXGBE_HLREG0);
-	if (dev->data->dev_conf.rxmode.hw_strip_crc)
+	if (rx_conf->hw_strip_crc)
 		hlreg0 |= IXGBE_HLREG0_RXCRCSTRP;
 	else
 		hlreg0 &= ~IXGBE_HLREG0_RXCRCSTRP;
@@ -3554,11 +3560,11 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	/*
 	 * Configure jumbo frame support, if any.
 	 */
-	if (dev->data->dev_conf.rxmode.jumbo_frame == 1) {
+	if (rx_conf->jumbo_frame == 1) {
 		hlreg0 |= IXGBE_HLREG0_JUMBOEN;
 		maxfrs = IXGBE_READ_REG(hw, IXGBE_MAXFRS);
 		maxfrs &= 0x0000FFFF;
-		maxfrs |= (dev->data->dev_conf.rxmode.max_rx_pkt_len << 16);
+		maxfrs |= (rx_conf->max_rx_pkt_len << 16);
 		IXGBE_WRITE_REG(hw, IXGBE_MAXFRS, maxfrs);
 	} else
 		hlreg0 &= ~IXGBE_HLREG0_JUMBOEN;
@@ -3582,9 +3588,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		 * Reset crc_len in case it was changed after queue setup by a
 		 * call to configure.
 		 */
-		rxq->crc_len = (uint8_t)
-				((dev->data->dev_conf.rxmode.hw_strip_crc) ? 0 :
-				ETHER_CRC_LEN);
+		rxq->crc_len = rx_conf->hw_strip_crc ? 0 : ETHER_CRC_LEN;
 
 		/* Setup the Base and Length of the Rx Descriptor Rings */
 		bus_addr = rxq->rx_ring_phys_addr;
@@ -3602,7 +3606,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		/*
 		 * Configure Header Split
 		 */
-		if (dev->data->dev_conf.rxmode.header_split) {
+		if (rx_conf->header_split) {
 			if (hw->mac.type == ixgbe_mac_82599EB) {
 				/* Must setup the PSRTYPE register */
 				uint32_t psrtype;
@@ -3612,7 +3616,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 					IXGBE_PSRTYPE_IPV6HDR;
 				IXGBE_WRITE_REG(hw, IXGBE_PSRTYPE(rxq->reg_idx), psrtype);
 			}
-			srrctl = ((dev->data->dev_conf.rxmode.split_hdr_size <<
+			srrctl = ((rx_conf->split_hdr_size <<
 				IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
 				IXGBE_SRRCTL_BSIZEHDR_MASK);
 			srrctl |= IXGBE_SRRCTL_DESCTYPE_HDR_SPLIT_ALWAYS;
@@ -3669,7 +3673,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	 */
 	rxcsum = IXGBE_READ_REG(hw, IXGBE_RXCSUM);
 	rxcsum |= IXGBE_RXCSUM_PCSD;
-	if (dev->data->dev_conf.rxmode.hw_ip_checksum)
+	if (rx_conf->hw_ip_checksum)
 		rxcsum |= IXGBE_RXCSUM_IPPCSE;
 	else
 		rxcsum &= ~IXGBE_RXCSUM_IPPCSE;
@@ -3678,7 +3682,7 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 	if (hw->mac.type == ixgbe_mac_82599EB) {
 		rdrxctl = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
-		if (dev->data->dev_conf.rxmode.hw_strip_crc)
+		if (rx_conf->hw_strip_crc)
 			rdrxctl |= IXGBE_RDRXCTL_CRCSTRIP;
 		else
 			rdrxctl &= ~IXGBE_RDRXCTL_CRCSTRIP;
