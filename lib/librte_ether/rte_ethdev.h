@@ -312,6 +312,9 @@ enum rte_eth_tx_mq_mode {
 #define ETH_VMDQ_DCB_TX             ETH_MQ_TX_VMDQ_DCB
 #define ETH_DCB_TX                  ETH_MQ_TX_DCB
 
+/* TODO: Remove this when DPDK version bumps up to 2.0.1 */
+#define RTE_ETHDEV_HAS_LRO_SUPPORT
+
 /**
  * A structure used to configure the RX features of an Ethernet port.
  */
@@ -320,14 +323,15 @@ struct rte_eth_rxmode {
 	enum rte_eth_rx_mq_mode mq_mode;
 	uint32_t max_rx_pkt_len;  /**< Only used if jumbo_frame enabled. */
 	uint16_t split_hdr_size;  /**< hdr buf size (header_split enabled).*/
-	uint8_t header_split : 1, /**< Header Split enable. */
+	uint16_t header_split : 1, /**< Header Split enable. */
 		hw_ip_checksum   : 1, /**< IP/UDP/TCP checksum offload enable. */
 		hw_vlan_filter   : 1, /**< VLAN filter enable. */
 		hw_vlan_strip    : 1, /**< VLAN strip enable. */
 		hw_vlan_extend   : 1, /**< Extended VLAN enable. */
 		jumbo_frame      : 1, /**< Jumbo Frame Receipt enable. */
 		hw_strip_crc     : 1, /**< Enable CRC stripping by hardware. */
-		enable_scatter   : 1; /**< Enable scatter packets rx handler */
+		enable_scatter   : 1, /**< Enable scatter packets rx handler */
+		enable_lro       : 1; /**< Enable LRO */
 };
 
 /**
@@ -1515,6 +1519,7 @@ struct rte_eth_dev_data {
 	uint8_t port_id;           /**< Device [external] port identifier. */
 	uint8_t promiscuous   : 1, /**< RX promiscuous mode ON(1) / OFF(0). */
 		scattered_rx : 1,  /**< RX of scattered packets is ON(1) / OFF(0) */
+		lro          : 1,  /**< RX LRO is ON(1) / OFF(0) */
 		all_multicast : 1, /**< RX all multicast mode ON(1) / OFF(0). */
 		dev_started : 1;   /**< Device state: STARTED(1) / STOPPED(0). */
 };
