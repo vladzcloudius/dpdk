@@ -772,13 +772,6 @@ eth_ixgbe_dev_init(__attribute__((unused)) struct eth_driver *eth_drv,
 	hw->hw_addr = (void *)pci_dev->mem_resource[0].addr;
 	hw->allow_unsupported_sfp = 1;
 
-	/*
-	 * Initialize to TRUE. If any of Rx queues doesn't meet the bulk
-	 * allocation or vector Rx preconditions we will reset it.
-	 */
-	hw->rx_bulk_alloc_allowed = true;
-	hw->rx_vec_allowed = true;
-
 	/* Initialize the shared code (base driver) */
 #ifdef RTE_NIC_BYPASS
 	diag = ixgbe_bypass_init_shared_code(hw);
@@ -1441,11 +1434,20 @@ ixgbe_dev_configure(struct rte_eth_dev *dev)
 {
 	struct ixgbe_interrupt *intr =
 		IXGBE_DEV_PRIVATE_TO_INTR(dev->data->dev_private);
+	struct ixgbe_hw *hw =
+		IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
 
 	PMD_INIT_FUNC_TRACE();
 
 	/* set flag to update link status after init */
 	intr->flags |= IXGBE_FLAG_NEED_LINK_UPDATE;
+
+	/*
+	 * Initialize to TRUE. If any of Rx queues doesn't meet the bulk
+	 * allocation or vector Rx preconditions we will reset it.
+	 */
+	hw->rx_bulk_alloc_allowed = true;
+	hw->rx_vec_allowed = true;
 
 	return 0;
 }
@@ -1648,8 +1650,7 @@ ixgbe_dev_stop(struct rte_eth_dev *dev)
 
 	/* Clear stored conf */
 	dev->data->scattered_rx = 0;
-	hw->rx_bulk_alloc_allowed = false;
-	hw->rx_vec_allowed = false;
+	dev->data->lro = 0;
 
 	/* Clear recorded link status */
 	memset(&link, 0, sizeof(link));
@@ -2018,6 +2019,11 @@ ixgbe_dev_info_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *dev_info)
 		DEV_RX_OFFLOAD_IPV4_CKSUM |
 		DEV_RX_OFFLOAD_UDP_CKSUM  |
 		DEV_RX_OFFLOAD_TCP_CKSUM;
+
+	if (hw->mac.type == ixgbe_mac_82599EB ||
+	    hw->mac.type == ixgbe_mac_X540)
+		dev_info->rx_offload_capa |= DEV_RX_OFFLOAD_TCP_LRO;
+
 	dev_info->tx_offload_capa =
 		DEV_TX_OFFLOAD_VLAN_INSERT |
 		DEV_TX_OFFLOAD_IPV4_CKSUM  |
