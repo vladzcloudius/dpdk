@@ -234,8 +234,14 @@ struct ixgbe_thermal_sensor_data {
 #define IXGBE_EITR(_i)		(((_i) <= 23) ? (0x00820 + ((_i) * 4)) : \
 				 (0x012300 + (((_i) - 24) * 4)))
 #define IXGBE_EITR_ITR_INT_MASK	0x00000FF8
+#define IXGBE_EITR_ITR_INT_SHIFT 3
 #define IXGBE_EITR_LLI_MOD	0x00008000
 #define IXGBE_EITR_CNT_WDIS	0x80000000
+/* EITR Inteval is in 2048ns uinits for 1G and 10G link */
+#define IXGBE_EITR_INTERVAL_UNIT_NS	2048
+#define IXGBE_EITR_INTERVAL_US(us)	\
+   (((us) * 1000 / IXGBE_EITR_INTERVAL_UNIT_NS << IXGBE_EITR_ITR_INT_SHIFT) & \
+		IXGBE_EITR_ITR_INT_MASK)
 #define IXGBE_IVAR(_i)		(0x00900 + ((_i) * 4)) /* 24 at 0x900-0x960 */
 #define IXGBE_IVAR_MISC		0x00A00 /* misc MSI-X interrupt causes */
 #define IXGBE_EITRSEL		0x00894
