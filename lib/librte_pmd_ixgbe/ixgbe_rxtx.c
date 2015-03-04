@@ -2390,12 +2390,12 @@ check_rx_burst_bulk_alloc_preconditions(__rte_unused struct igb_rx_queue *rxq)
 
 /* Reset dynamic igb_rx_queue fields back to defaults */
 static void
-ixgbe_reset_rx_queue(struct igb_rx_queue *rxq)
+ixgbe_reset_rx_queue(struct ixgbe_hw *hw, struct igb_rx_queue *rxq)
 {
 	static const union ixgbe_adv_rx_desc zeroed_desc = { .read = {
 			.pkt_addr = 0}};
 	unsigned i;
-	uint16_t len;
+	uint16_t len = rxq->nb_rx_desc;
 
 	/*
 	 * By default, the Rx queue setup function allocates enough memory for
@@ -2407,14 +2407,9 @@ ixgbe_reset_rx_queue(struct igb_rx_queue *rxq)
 	 * constraints here to see if we need to zero out memory after the end
 	 * of the H/W descriptor ring.
 	 */
-#ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
-	if (check_rx_burst_bulk_alloc_preconditions(rxq) == 0)
+	if (hw->rx_bulk_alloc_allowed)
 		/* zero out extra memory */
-		len = (uint16_t)(rxq->nb_rx_desc + RTE_PMD_IXGBE_RX_MAX_BURST);
-	else
-#endif
-		/* do not zero out extra memory */
-		len = rxq->nb_rx_desc;
+		len += RTE_PMD_IXGBE_RX_MAX_BURST;
 
 	/*
 	 * Zero out HW ring memory. Zero out extra memory at the end of
@@ -2457,7 +2452,6 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	const struct rte_memzone *rz;
 	struct igb_rx_queue *rxq;
 	struct ixgbe_hw     *hw;
-	int use_def_burst_func = 1;
 	uint16_t len;
 	struct rte_eth_dev_info dev_info = { 0 };
 	struct rte_eth_rxmode *dev_rx_mode = &dev->data->dev_conf.rxmode;
@@ -2550,11 +2544,10 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	 * S/W ring to make sure look-ahead logic in bulk alloc Rx burst
 	 * function does not access an invalid memory region.
 	 */
-#ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
-	len = (uint16_t)(nb_desc + RTE_PMD_IXGBE_RX_MAX_BURST);
-#else
 	len = nb_desc;
-#endif
+	if (hw->rx_bulk_alloc_allowed)
+		len += RTE_PMD_IXGBE_RX_MAX_BURST;
+
 	rxq->sw_ring = rte_zmalloc_socket("rxq->sw_ring",
 					  sizeof(struct igb_rx_entry) * len,
 					  RTE_CACHE_LINE_SIZE, socket_id);
@@ -2583,45 +2576,19 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 
 	/*
 	 * Certain constraints must be met in order to use the bulk buffer
-	 * allocation Rx burst function.
+	 * allocation Rx burst function. If any of Rx queues doesn't meet them
+	 * the feature should be disabled for the whole port.
 	 */
-	use_def_burst_func = check_rx_burst_bulk_alloc_preconditions(rxq);
+	if (check_rx_burst_bulk_alloc_preconditions(rxq))
+		hw->rx_bulk_alloc_allowed = false;
 
 #ifdef RTE_IXGBE_INC_VECTOR
 	ixgbe_rxq_vec_setup(rxq);
 #endif
-	/*
-	 * TODO: This must be moved to ixgbe_dev_rx_init() since rx_pkt_burst
-	 * is a global per-device callback thus bulk allocation may be used
-	 * only if all queues meet the above preconditions.
-	 */
 
-	/* Check if pre-conditions are satisfied, and no Scattered Rx */
-	if (!use_def_burst_func && !dev->data->scattered_rx) {
-#ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
-		PMD_INIT_LOG(DEBUG, "Rx Burst Bulk Alloc Preconditions are "
-			     "satisfied. Rx Burst Bulk Alloc function will be "
-			     "used on port=%d, queue=%d.",
-			     rxq->port_id, rxq->queue_id);
-		dev->rx_pkt_burst = ixgbe_recv_pkts_bulk_alloc;
-#ifdef RTE_IXGBE_INC_VECTOR
-		if (!ixgbe_rx_vec_condition_check(dev)) {
-			PMD_INIT_LOG(INFO, "Vector rx enabled, please make "
-				     "sure RX burst size no less than 32.");
-			dev->rx_pkt_burst = ixgbe_recv_pkts_vec;
-		}
-#endif
-#endif
-	} else {
-		PMD_INIT_LOG(DEBUG, "Rx Burst Bulk Alloc Preconditions "
-			     "are not satisfied, Scattered Rx is requested, "
-			     "or RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC is not "
-			     "enabled (port=%d, queue=%d).",
-			     rxq->port_id, rxq->queue_id);
-	}
 	dev->data->rx_queues[queue_idx] = rxq;
 
-	ixgbe_reset_rx_queue(rxq);
+	ixgbe_reset_rx_queue(hw, rxq);
 
 	return 0;
 }
@@ -2675,6 +2642,7 @@ void
 ixgbe_dev_clear_queues(struct rte_eth_dev *dev)
 {
 	unsigned i;
+	struct ixgbe_hw *hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
 
 	PMD_INIT_FUNC_TRACE();
 
@@ -2690,7 +2658,7 @@ ixgbe_dev_clear_queues(struct rte_eth_dev *dev)
 		struct igb_rx_queue *rxq = dev->data->rx_queues[i];
 		if (rxq != NULL) {
 			ixgbe_rx_queue_release_mbufs(rxq);
-			ixgbe_reset_rx_queue(rxq);
+			ixgbe_reset_rx_queue(hw, rxq);
 		}
 	}
 }
@@ -3928,6 +3896,65 @@ ixgbe_set_ivar(struct rte_eth_dev *dev, u8 entry, u8 vector, s8 type)
 	}
 }
 
+void set_rx_function(struct rte_eth_dev *dev)
+{
+	struct ixgbe_hw *hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
+	bool vec_is_allowed = !ixgbe_rx_vec_condition_check(dev);
+
+	/* Check if bulk alloc is allowed and no Scattered Rx */
+	if (hw->rx_bulk_alloc_allowed && !dev->data->scattered_rx) {
+		PMD_INIT_LOG(DEBUG, "Rx Burst Bulk Alloc Preconditions are "
+			     "satisfied. Rx Burst Bulk Alloc function will be "
+			     "used on port=%d.", dev->data->port_id);
+		dev->rx_pkt_burst = ixgbe_recv_pkts_bulk_alloc;
+
+		if (vec_is_allowed) {
+			PMD_INIT_LOG(INFO, "Vector rx enabled, please make "
+				     "sure RX burst size no less than 32.");
+			dev->rx_pkt_burst = ixgbe_recv_pkts_vec;
+		}
+	} else {
+		dev->rx_pkt_burst = ixgbe_recv_pkts;
+
+		PMD_INIT_LOG(DEBUG, "Rx Burst Bulk Alloc Preconditions "
+			     "are not satisfied, or Scattered Rx is requested, "
+			     "or RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC is not "
+			     "enabled (port=%d).", dev->data->port_id);
+	}
+
+	if (dev->data->scattered_rx) {
+		if (vec_is_allowed) {
+			PMD_INIT_LOG(DEBUG, "Using Vector Scattered Rx Bulk "
+					    "callback (port=%d).",
+				     dev->data->port_id);
+			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_vec;
+		} else {
+			PMD_INIT_LOG(DEBUG, "Using Regualr (non-vector) "
+					    "Scattered Rx Bulk callback "
+					    "(port=%d).", dev->data->port_id);
+			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
+		}
+	}
+
+	/*
+	 * Initialize the appropriate LRO callback.
+	 *
+	 * If all queues satisfy the bulk allocation preconditions
+	 * (hw->rx_bulk_alloc_allowed is TRUE) then we may use bulk allocation.
+	 * Otherwise use a single allocation version.
+	 */
+	if (dev->data->lro) {
+		if (hw->rx_bulk_alloc_allowed) {
+			PMD_INIT_LOG(INFO, "LRO is requested. Using a bulk "
+					   "allocation version");
+			dev->rx_pkt_burst = ixgbe_recv_pkts_lro_bulk_alloc;
+		} else {
+			PMD_INIT_LOG(INFO, "LRO is requested. Using a single "
+					   "allocation version");
+			dev->rx_pkt_burst = ixgbe_recv_pkts_lro;
+		}
+	}
+}
 
 /*
  * Initializes Receive Unit.
@@ -3954,7 +3981,6 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 	struct rte_eth_rxmode *rx_conf = &dev->data->dev_conf.rxmode;
 	struct rte_eth_dev_info dev_info = { 0 };
 	bool rsc_capable = false;
-	int bulk_alloc_cond = 0;
 
 	/* Sanity check */
 	dev->dev_ops->dev_infos_get(dev, &dev_info);
@@ -4146,11 +4172,6 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 			if (!dev->data->scattered_rx)
 				PMD_INIT_LOG(DEBUG, "forcing scatter mode");
 			dev->data->scattered_rx = 1;
-#ifdef RTE_IXGBE_INC_VECTOR
-			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_vec;
-#else
-			dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
-#endif
 		}
 
 		/* RSC per-queue configuration */
@@ -4195,24 +4216,15 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 
 			rxq->rsc_en = 1;
 		}
-
-		/*
-		 * We may use bulk allocation only all queues satisfy the
-		 * preconditions.
-		 */
-		bulk_alloc_cond |= check_rx_burst_bulk_alloc_preconditions(rxq);
 	}
 
-	if (rx_conf->enable_scatter) {
-		if (!dev->data->scattered_rx)
-			PMD_INIT_LOG(DEBUG, "forcing scatter mode");
-#ifdef RTE_IXGBE_INC_VECTOR
-		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts_vec;
-#else
-		dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
-#endif
+	if (rx_conf->enable_scatter)
 		dev->data->scattered_rx = 1;
-	}
+
+	if (rx_conf->enable_lro)
+		dev->data->lro = 1;
+
+	set_rx_function(dev);
 
 	/*
 	 * Device configured with multiple RX queues.
@@ -4254,24 +4266,6 @@ ixgbe_dev_rx_init(struct rte_eth_dev *dev)
 		IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, rdrxctl);
 
 		PMD_INIT_LOG(INFO, "enabling LRO mode");
-
-		dev->data->lro = 1;
-		/*
-		 * Initialize the appropriate LRO callback. If all queues
-		 * satisfy the bulk allocation preconditions (bulk_alloc_cond
-		 * is zero) then we may use bulk allocation. Otherwise use a
-		 * single allocation version.
-		 */
-		if (!bulk_alloc_cond) {
-			PMD_INIT_LOG(INFO, "LRO is requested. Using a bulk "
-					   "allocation version");
-			dev->rx_pkt_burst = ixgbe_recv_pkts_lro_bulk_alloc;
-			dev->data->lro_bulk_alloc = 1;
-		} else {
-			PMD_INIT_LOG(INFO, "LRO is requested. Using a single "
-					   "allocation version");
-			dev->rx_pkt_burst = ixgbe_recv_pkts_lro;
-		}
 	}
 
 
@@ -4520,7 +4514,7 @@ ixgbe_dev_rx_queue_stop(struct rte_eth_dev *dev, uint16_t rx_queue_id)
 		rte_delay_us(RTE_IXGBE_WAIT_100_US);
 
 		ixgbe_rx_queue_release_mbufs(rxq);
-		ixgbe_reset_rx_queue(rxq);
+		ixgbe_reset_rx_queue(hw, rxq);
 	} else
 		return -1;
 

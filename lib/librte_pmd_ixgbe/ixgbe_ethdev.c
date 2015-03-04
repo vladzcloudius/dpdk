@@ -760,15 +760,7 @@ eth_ixgbe_dev_init(__attribute__((unused)) struct eth_driver *eth_drv,
 			                   "Using default TX function.");
 		}
 
-		if (eth_dev->data->scattered_rx)
-			eth_dev->rx_pkt_burst = ixgbe_recv_scattered_pkts;
-
-		if (eth_dev->data->lro) {
-			if (eth_dev->data->lro_bulk_alloc)
-				eth_dev->rx_pkt_burst = ixgbe_recv_pkts_lro_bulk_alloc;
-			else
-				eth_dev->rx_pkt_burst = ixgbe_recv_pkts_lro;
-		}
+		set_rx_function(eth_dev);
 
 		return 0;
 	}
@@ -779,6 +771,15 @@ eth_ixgbe_dev_init(__attribute__((unused)) struct eth_driver *eth_drv,
 	hw->vendor_id = pci_dev->id.vendor_id;
 	hw->hw_addr = (void *)pci_dev->mem_resource[0].addr;
 	hw->allow_unsupported_sfp = 1;
+#ifdef RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC
+	/*
+	 * Initialize to TRUE. If any of Rx queues doesn't meet the bulk
+	 * allocation preconditions we will reset it.
+	 */
+	hw->rx_bulk_alloc_allowed = true;
+#else
+	hw->rx_bulk_alloc_allowed = false;
+#endif /* RTE_LIBRTE_IXGBE_RX_ALLOW_BULK_ALLOC */
 
 	/* Initialize the shared code (base driver) */
 #ifdef RTE_NIC_BYPASS
@@ -1650,7 +1651,7 @@ ixgbe_dev_stop(struct rte_eth_dev *dev)
 	/* Clear stored conf */
 	dev->data->scattered_rx = 0;
 	dev->data->lro = 0;
-	dev->data->lro_bulk_alloc = 0;
+	hw->rx_bulk_alloc_allowed = false;
 
 	/* Clear recorded link status */
 	memset(&link, 0, sizeof(link));

@@ -760,6 +760,7 @@ int ixgbe_txq_vec_setup(struct igb_tx_queue *txq)
 	return 0;
 }
 
+#ifdef RTE_IXGBE_INC_VECTOR
 int ixgbe_rx_vec_condition_check(struct rte_eth_dev *dev)
 {
 #ifndef RTE_LIBRTE_IEEE1588
@@ -791,3 +792,9 @@ int ixgbe_rx_vec_condition_check(struct rte_eth_dev *dev)
 	return -1;
 #endif
 }
+#else
+int ixgbe_rx_vec_condition_check(struct rte_eth_dev __rte_unused *dev)
+{
+	return -1;
+}
+#endif /* RTE_IXGBE_INC_VECTOR */

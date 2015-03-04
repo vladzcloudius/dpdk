@@ -261,6 +261,22 @@ struct ixgbe_txq_ops {
  */
 void set_tx_function(struct rte_eth_dev *dev, struct igb_tx_queue *txq);
 
+/**
+ * Sets the rx_pkt_burst callback in the ixgbe rte_eth_dev instance.
+ *
+ * Sets the callback based on the device parameters:
+ *  - ixgbe_hw.rx_bulk_alloc_allowed
+ *  - rte_eth_dev_data.scattered_rx
+ *  - rte_eth_dev_data.lro
+ *  - conditions checked in ixgbe_rx_vec_condition_check()
+ *
+ *  This means that the parameters above have to be configured prior to calling
+ *  to this function.
+ *
+ * @dev rte_eth_dev handle
+ */
+void set_rx_function(struct rte_eth_dev *dev);
+
 #ifdef RTE_IXGBE_INC_VECTOR
 uint16_t ixgbe_recv_pkts_vec(void *rx_queue, struct rte_mbuf **rx_pkts,
 		uint16_t nb_pkts);
