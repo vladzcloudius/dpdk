@@ -2579,8 +2579,13 @@ ixgbe_dev_rx_queue_setup(struct rte_eth_dev *dev,
 	 * allocation Rx burst function. If any of Rx queues doesn't meet them
 	 * the feature should be disabled for the whole port.
 	 */
-	if (check_rx_burst_bulk_alloc_preconditions(rxq))
+	if (check_rx_burst_bulk_alloc_preconditions(rxq)) {
+		PMD_INIT_LOG(DEBUG, "queue[%d] doesn't meet Rx Bulk Alloc "
+				    "preconditions - canceling the feature for "
+				    "the whole port[%d]",
+			     rxq->queue_id, rxq->port_id);
 		hw->rx_bulk_alloc_allowed = false;
+	}
 
 #ifdef RTE_IXGBE_INC_VECTOR
 	ixgbe_rxq_vec_setup(rxq);
@@ -3900,6 +3905,10 @@ void set_rx_function(struct rte_eth_dev *dev)
 {
 	struct ixgbe_hw *hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
 	bool vec_is_allowed = !ixgbe_rx_vec_condition_check(dev);
+
+	if (!vec_is_allowed)
+		PMD_INIT_LOG(DEBUG, "port[%d] doesn't meet Vector Rx "
+				    "preconditions", dev->data->port_id);
 
 	/* Check if bulk alloc is allowed and no Scattered Rx */
 	if (hw->rx_bulk_alloc_allowed && !dev->data->scattered_rx) {
