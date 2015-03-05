@@ -792,9 +792,4 @@ int ixgbe_rx_vec_condition_check(struct rte_eth_dev *dev)
 	return -1;
 #endif
 }
-#else
-int ixgbe_rx_vec_condition_check(struct rte_eth_dev __rte_unused *dev)
-{
-	return -1;
-}
 #endif /* RTE_IXGBE_INC_VECTOR */

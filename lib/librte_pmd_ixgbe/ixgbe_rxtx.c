@@ -4878,3 +4878,26 @@ ixgbevf_dev_rxtx_start(struct rte_eth_dev *dev)
 
 	}
 }
+
+/* Stubs needed for linkage when CONFIG_RTE_IXGBE_INC_VECTOR is set to 'n' */
+#ifndef RTE_IXGBE_INC_VECTOR
+int ixgbe_rx_vec_condition_check(
+	struct rte_eth_dev __rte_unused *dev)
+{
+	return -1;
+}
+
+uint16_t
+ixgbe_recv_pkts_vec(void __rte_unused *rx_queue,
+		    struct rte_mbuf __rte_unused **rx_pkts,
+		    uint16_t __rte_unused nb_pkts)
+{
+	return 0;
+}
+
+uint16_t ixgbe_recv_scattered_pkts_vec(void __rte_unused *rx_queue,
+	struct rte_mbuf __rte_unused **rx_pkts, uint16_t __rte_unused nb_pkts)
+{
+	return 0;
+}
+#endif
