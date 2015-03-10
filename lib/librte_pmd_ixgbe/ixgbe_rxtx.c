@@ -1581,7 +1581,9 @@ next_desc:
 			rxm->data_off = RTE_PKTMBUF_HEADROOM;
 			rxdp->read.hdr_addr = dma;
 			rxdp->read.pkt_addr = dma;
-		}
+		} else
+			rxe->mbuf = NULL;
+
 		/*
 		 * Set data length & data buffer address of mbuf.
 		 */
