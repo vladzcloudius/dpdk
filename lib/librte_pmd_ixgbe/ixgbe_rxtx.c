@@ -2287,6 +2287,30 @@ ixgbe_dev_tx_queue_setup(struct rte_eth_dev *dev,
 	return (0);
 }
 
+/**
+ * Free the not-yet-copleted RSC cluster from the sw_rsc_ring
+ *
+ * (not-yet-completed) RSC clusters in the sw_src_ring are not stored in the
+ * standard form when the last segment's "next" pointer is set to NULL but
+ * rather points to the next mbuf of this RSC aggregation that is not yet
+ * completed. To make the cluster ready to be fed to rte_pktmbuf_free() we just
+ * need to reset this "next" pointer. We will simply skip the (nb_segs - 1)
+ * entries in the cluster to get to the last segment for that.
+ *
+ * @param head RSC cluster head
+ */
+static void _free_rsc_cluster(struct rte_mbuf *head)
+{
+	uint8_t i;
+	struct rte_mbuf *last_seg = head;
+
+	for (i = 1; i < head->nb_segs; i++)
+		last_seg = last_seg->next;
+
+	last_seg->next = NULL;
+	rte_pktmbuf_free(head);
+}
+
 static void
 ixgbe_rx_queue_release_mbufs(struct igb_rx_queue *rxq)
 {
@@ -2310,6 +2334,13 @@ ixgbe_rx_queue_release_mbufs(struct igb_rx_queue *rxq)
 		}
 #endif
 	}
+
+	if (rxq->sw_rsc_ring)
+		for (i = 0; i < rxq->nb_rx_desc; i++)
+			if (rxq->sw_rsc_ring[i].fbuf) {
+				_free_rsc_cluster(rxq->sw_rsc_ring[i].fbuf);
+				rxq->sw_rsc_ring[i].fbuf = NULL;
+			}
 }
 
 static void
