@@ -1685,6 +1685,7 @@ next_desc:
 			   "nb_hold=%u nb_rx=%u",
 			   rxq->port_id, rxq->queue_id, rx_id, nb_hold, nb_rx);
 
+		rte_wmb();
 		IXGBE_PCI_REG_WRITE(rxq->rdt_reg_addr, prev_id);
 		nb_hold = 0;
 	}
