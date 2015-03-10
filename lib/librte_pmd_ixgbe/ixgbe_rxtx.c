@@ -2299,18 +2299,17 @@ ixgbe_dev_tx_queue_setup(struct rte_eth_dev *dev,
  * need to reset this "next" pointer. We will simply skip the (nb_segs - 1)
  * entries in the cluster to get to the last segment for that.
  *
- * @param head RSC cluster head
+ * @param m RSC cluster head
  */
-static void _free_rsc_cluster(struct rte_mbuf *head)
+static void _free_rsc_cluster(struct rte_mbuf *m)
 {
-	uint8_t i;
-	struct rte_mbuf *last_seg = head;
+	uint8_t i, nb_segs = m->nb_segs;
+	struct rte_mbuf *next_seg = m->next;
 
-	for (i = 1; i < head->nb_segs; i++)
-		last_seg = last_seg->next;
-
-	last_seg->next = NULL;
-	rte_pktmbuf_free(head);
+	for (i = 0; i < nb_segs; i++, next_seg = next_seg->next) {
+		rte_pktmbuf_free_seg(m);
+		m = next_seg;
+	}
 }
 
 static void
