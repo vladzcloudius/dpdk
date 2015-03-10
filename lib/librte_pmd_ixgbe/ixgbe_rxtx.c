@@ -2427,7 +2427,7 @@ static void
 ixgbe_reset_rx_queue(struct ixgbe_hw *hw, struct igb_rx_queue *rxq)
 {
 	static const union ixgbe_adv_rx_desc zeroed_desc = { .read = {
-			.pkt_addr = 0}};
+			.pkt_addr = 0, .hdr_addr = 0}};
 	unsigned i;
 	uint16_t len = rxq->nb_rx_desc;
 
