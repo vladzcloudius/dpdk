@@ -1368,7 +1368,8 @@ ixgbe_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 /**
  * Detect an RSC descriptor.
  */
-static inline uint32_t ixgbe_rsc_count(union ixgbe_adv_rx_desc *rx)
+static inline uint32_t
+ixgbe_rsc_count(union ixgbe_adv_rx_desc *rx)
 {
 	return (rte_le_to_cpu_32(rx->wb.lower.lo_dword.data) &
 		IXGBE_RXDADV_RSCCNT_MASK) >> IXGBE_RXDADV_RSCCNT_SHIFT;
@@ -1420,7 +1421,7 @@ static inline void ixgbe_fill_cluster_head_buf(
 }
 
 /**
- * Bulk receive handler for and LRO case.
+ * ixgbe_recv_pkts_lro - receive handler for and LRO case.
  *
  * @rx_queue Rx queue handle
  * @rx_pkts table of received packets
@@ -1446,8 +1447,8 @@ static inline void ixgbe_fill_cluster_head_buf(
  * receive" interface).
  */
 static inline uint16_t
-_recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
-	       bool bulk_alloc)
+ixgbe_recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
+		    bool bulk_alloc)
 {
 	struct ixgbe_rx_queue *rxq = rx_queue;
 	volatile union ixgbe_adv_rx_desc *rx_ring = rxq->rx_ring;
@@ -1695,16 +1696,17 @@ next_desc:
 }
 
 uint16_t
-ixgbe_recv_pkts_lro(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts)
+ixgbe_recv_pkts_lro_single_alloc(void *rx_queue, struct rte_mbuf **rx_pkts,
+				 uint16_t nb_pkts)
 {
-	return _recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, false);
+	return ixgbe_recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, false);
 }
 
 uint16_t
 ixgbe_recv_pkts_lro_bulk_alloc(void *rx_queue, struct rte_mbuf **rx_pkts,
 			       uint16_t nb_pkts)
 {
-	return _recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, true);
+	return ixgbe_recv_pkts_lro(rx_queue, rx_pkts, nb_pkts, true);
 }
 
 uint16_t
@@ -2291,7 +2293,7 @@ ixgbe_dev_tx_queue_setup(struct rte_eth_dev *dev,
 }
 
 /**
- * Free the not-yet-completed RSC cluster from the sw_rsc_ring
+ * ixgbe_free_rsc_cluster - free the not-yet-completed RSC cluster
  *
  * The "next" pointer of the last segment of (not-yet-completed) RSC clusters
  * in the sw_rsc_ring is not set to NULL but rather points to the next
@@ -2300,14 +2302,16 @@ ixgbe_dev_tx_queue_setup(struct rte_eth_dev *dev,
  * will just free first "nb_segs" segments of the cluster explicitly by calling
  * an rte_pktmbuf_free_seg().
  *
- * @param m RSC cluster head
+ * @m RSC cluster head
  */
-static void _free_rsc_cluster(struct rte_mbuf *m)
+static void
+ixgbe_free_rsc_cluster(struct rte_mbuf *m)
 {
 	uint8_t i, nb_segs = m->nb_segs;
-	struct rte_mbuf *next_seg = m->next;
+	struct rte_mbuf *next_seg;
 
-	for (i = 0; i < nb_segs; i++, next_seg = next_seg->next) {
+	for (i = 0; i < nb_segs; i++) {
+		next_seg = m->next;
 		rte_pktmbuf_free_seg(m);
 		m = next_seg;
 	}
@@ -2340,7 +2344,7 @@ ixgbe_rx_queue_release_mbufs(struct ixgbe_rx_queue *rxq)
 	if (rxq->sw_rsc_ring)
 		for (i = 0; i < rxq->nb_rx_desc; i++)
 			if (rxq->sw_rsc_ring[i].fbuf) {
-				_free_rsc_cluster(rxq->sw_rsc_ring[i].fbuf);
+				ixgbe_free_rsc_cluster(rxq->sw_rsc_ring[i].fbuf);
 				rxq->sw_rsc_ring[i].fbuf = NULL;
 			}
 }
@@ -3869,14 +3873,15 @@ ixgbe_dev_mq_tx_configure(struct rte_eth_dev *dev)
 }
 
 /**
- * get_rscctl_maxdesc - Calculate the RSCCTL[n].MAXDESC for PF
+ * ixgbe_get_rscctl_maxdesc - Calculate the RSCCTL[n].MAXDESC for PF
  *
  * Return the RSCCTL[n].MAXDESC for 82599 and x540 PF devices according to the
  * spec rev. 3.0 chapter 8.2.3.8.13.
  *
  * @pool Memory pool of the Rx queue
  */
-static inline uint32_t get_rscctl_maxdesc(struct rte_mempool *pool)
+static inline uint32_t
+ixgbe_get_rscctl_maxdesc(struct rte_mempool *pool)
 {
 	struct rte_pktmbuf_pool_private *mp_priv = rte_mempool_get_priv(pool);
 
@@ -3895,13 +3900,18 @@ static inline uint32_t get_rscctl_maxdesc(struct rte_mempool *pool)
 		return IXGBE_RSCCTL_MAXDESC_1;
 }
 
-/* (Taken from FreeBSD tree)
-** Setup the correct IVAR register for a particular MSIX interrupt
-**   (yes this is all very magic and confusing :)
-**  - entry is the register array entry
-**  - vector is the MSIX vector for this queue
-**  - type is RX/TX/MISC
-*/
+/**
+ * ixgbe_set_ivar - Setup the correct IVAR register for a particular MSIX
+ * interrupt
+ *
+ * (Taken from FreeBSD tree)
+ * (yes this is all very magic and confusing :)
+ *
+ * @dev port handle
+ * @entry the register array entry
+ * @vector the MSIX vector for this queue
+ * @type RX/TX/MISC
+ */
 static void
 ixgbe_set_ivar(struct rte_eth_dev *dev, u8 entry, u8 vector, s8 type)
 {
@@ -3980,7 +3990,7 @@ void ixgbe_set_rx_function(struct rte_eth_dev *dev)
 		} else {
 			PMD_INIT_LOG(INFO, "LRO is requested. Using a single "
 					   "allocation version");
-			dev->rx_pkt_burst = ixgbe_recv_pkts_lro;
+			dev->rx_pkt_burst = ixgbe_recv_pkts_lro_single_alloc;
 		}
 	} else if (dev->data->scattered_rx) {
 		/*
@@ -4032,6 +4042,16 @@ void ixgbe_set_rx_function(struct rte_eth_dev *dev)
 	}
 }
 
+/**
+ * ixgbe_set_rsc - configure RSC related port HW registers
+ *
+ * Configures the port's RSC related registers according to the 4.6.7.2 chapter
+ * of 82599 Spec (x540 configuration is virtually the same).
+ *
+ * @dev port handle
+ *
+ * Returns 0 in case of success or a non-zero error code
+ */
 static int
 ixgbe_set_rsc(struct rte_eth_dev *dev)
 {
@@ -4137,7 +4157,7 @@ ixgbe_set_rsc(struct rte_eth_dev *dev)
 		 */
 
 		rscctl |= IXGBE_RSCCTL_RSCEN;
-		rscctl |= get_rscctl_maxdesc(rxq->mb_pool);
+		rscctl |= ixgbe_get_rscctl_maxdesc(rxq->mb_pool);
 		psrtype |= IXGBE_PSRTYPE_TCPHDR;
 
 		/*

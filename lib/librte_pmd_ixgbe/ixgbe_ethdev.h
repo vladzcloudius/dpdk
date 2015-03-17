@@ -344,7 +344,7 @@ uint16_t ixgbe_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 uint16_t ixgbe_recv_scattered_pkts(void *rx_queue,
 		struct rte_mbuf **rx_pkts, uint16_t nb_pkts);
 
-uint16_t ixgbe_recv_pkts_lro(void *rx_queue,
+uint16_t ixgbe_recv_pkts_lro_single_alloc(void *rx_queue,
 		struct rte_mbuf **rx_pkts, uint16_t nb_pkts);
 uint16_t ixgbe_recv_pkts_lro_bulk_alloc(void *rx_queue,
 		struct rte_mbuf **rx_pkts, uint16_t nb_pkts);
