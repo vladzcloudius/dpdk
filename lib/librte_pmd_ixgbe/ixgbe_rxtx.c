@@ -4125,30 +4125,18 @@ ixgbe_set_rsc(struct rte_eth_dev *dev)
 		uint32_t eitr =
 			IXGBE_READ_REG(hw, IXGBE_EITR(rxq->reg_idx));
 
-#ifdef RTE_HEADER_SPLIT_ENABLE
 		/*
-		 * Print a warning if split_hdr_size is less than 128 bytes when
-		 * RSC is requested.
+		 * ixgbe PMD doesn't support header-split at the moment.
+		 *
+		 * Following the 4.6.7.2.1 chapter of the 82599/x540
+		 * Spec if RSC is enabled the SRRCTL[n].BSIZEHEADER
+		 * should be configured even if header split is not
+		 * enabled. We will configure it 128 bytes following the
+		 * recommendation in the spec.
 		 */
-		if (rx_conf->header_split) {
-			if (rx_conf->split_hdr_size < 128)
-				PMD_INIT_LOG(INFO, "split_hdr_size less than 128 "
-						   "bytes (%d)!",
-					     rx_conf->split_hdr_size);
-		} else
-#endif
-		{
-			/*
-			 * Following the 4.6.7.2.1 chapter of the 82599/x540
-			 * Spec if RSC is enabled the SRRCTL[n].BSIZEHEADER
-			 * should be configured even if header split is not
-			 * enabled. In the later case we will configure it 128
-			 * bytes following the recommendation in the spec.
-			 */
-			srrctl &= ~IXGBE_SRRCTL_BSIZEHDR_MASK;
-			srrctl |= (128 << IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
-						    IXGBE_SRRCTL_BSIZEHDR_MASK;
-		}
+		srrctl &= ~IXGBE_SRRCTL_BSIZEHDR_MASK;
+		srrctl |= (128 << IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT) &
+					    IXGBE_SRRCTL_BSIZEHDR_MASK;
 
 		/*
 		 * TODO: Consider setting the Receive Descriptor Minimum
