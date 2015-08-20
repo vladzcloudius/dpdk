@@ -866,12 +866,17 @@ eth_ixgbe_dev_init(struct rte_eth_dev *eth_dev)
 	uint32_t ctrl_ext;
 	uint16_t csum;
 	int diag, i;
+	bool rs_deferring_allowed = (hw->mac.type <= ixgbe_mac_82598EB);
 
 	PMD_INIT_FUNC_TRACE();
 
 	eth_dev->dev_ops = &ixgbe_eth_dev_ops;
 	eth_dev->rx_pkt_burst = &ixgbe_recv_pkts;
-	eth_dev->tx_pkt_burst = &ixgbe_xmit_pkts;
+
+	if (rs_deferring_allowed)
+		eth_dev->tx_pkt_burst = &ixgbe_xmit_pkts;
+	else
+		eth_dev->tx_pkt_burst = &ixgbe_xmit_pkts_always_rs;
 
 	/*
 	 * For secondary processes, we don't initialise any further as primary
@@ -1147,12 +1152,17 @@ eth_ixgbevf_dev_init(struct rte_eth_dev *eth_dev)
 	struct ixgbe_hwstrip *hwstrip =
 		IXGBE_DEV_PRIVATE_TO_HWSTRIP_BITMAP(eth_dev->data->dev_private);
 	struct ether_addr *perm_addr = (struct ether_addr *) hw->mac.perm_addr;
+	bool rs_deferring_allowed = (hw->mac.type <= ixgbe_mac_82598EB);
 
 	PMD_INIT_FUNC_TRACE();
 
 	eth_dev->dev_ops = &ixgbevf_eth_dev_ops;
 	eth_dev->rx_pkt_burst = &ixgbe_recv_pkts;
-	eth_dev->tx_pkt_burst = &ixgbe_xmit_pkts;
+
+	if (rs_deferring_allowed)
+		eth_dev->tx_pkt_burst = &ixgbe_xmit_pkts;
+	else
+		eth_dev->tx_pkt_burst = &ixgbe_xmit_pkts_always_rs;
 
 	/* for secondary processes, we don't initialise any further as primary
 	 * has already done this work. Only check we don't need a different

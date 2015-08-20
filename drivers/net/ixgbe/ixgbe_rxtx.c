@@ -2111,6 +2111,12 @@ ixgbe_set_tx_function(struct rte_eth_dev *dev, struct ixgbe_tx_queue *txq)
 	 */
 	bool rs_deferring_allowed = (hw->mac.type <= ixgbe_mac_82598EB);
 
+	if (rs_deferring_allowed)
+		PMD_INIT_LOG(DEBUG, "Using an RS bit setting deferring "
+				    "callback");
+	else
+		PMD_INIT_LOG(DEBUG, "Using an always setting RS bit callback");
+
 	/* Use a simple Tx queue (no offloads, no multi segs) if possible */
 	if (((txq->txq_flags & IXGBE_SIMPLE_FLAGS) == IXGBE_SIMPLE_FLAGS)
 			&& (txq->tx_rs_thresh >= RTE_PMD_IXGBE_TX_MAX_BURST)) {
