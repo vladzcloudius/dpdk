@@ -858,9 +858,13 @@ _ixgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		 */
 		cmd_type_len |= IXGBE_TXD_CMD_EOP;
 
-		if (always_rs)
+		if (always_rs) {
+			PMD_TX_FREE_LOG(DEBUG,
+					"Setting RS bit on TXD id="
+					"%4u (port=%d queue=%d)",
+					tx_last, txq->port_id, txq->queue_id);
 			cmd_type_len |= IXGBE_TXD_CMD_RS;
-		else
+		} else
 			txq->nb_tx_used = (uint16_t)(txq->nb_tx_used + nb_used);
 
 		txq->nb_tx_free = (uint16_t)(txq->nb_tx_free - nb_used);
