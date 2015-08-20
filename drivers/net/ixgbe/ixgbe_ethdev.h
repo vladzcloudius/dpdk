@@ -367,9 +367,13 @@ uint16_t ixgbe_recv_pkts_lro_bulk_alloc(void *rx_queue,
 
 uint16_t ixgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		uint16_t nb_pkts);
+uint16_t ixgbe_xmit_pkts_always_rs(
+	void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts);
 
 uint16_t ixgbe_xmit_pkts_simple(void *tx_queue, struct rte_mbuf **tx_pkts,
 		uint16_t nb_pkts);
+uint16_t ixgbe_xmit_pkts_simple_always_rs(
+	void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts);
 
 int ixgbe_dev_rss_hash_update(struct rte_eth_dev *dev,
 			      struct rte_eth_rss_conf *rss_conf);

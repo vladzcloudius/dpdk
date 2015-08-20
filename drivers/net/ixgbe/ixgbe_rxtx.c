@@ -164,11 +164,16 @@ ixgbe_tx_free_bufs(struct ixgbe_tx_queue *txq)
 
 /* Populate 4 descriptors with data from 4 mbufs */
 static inline void
-tx4(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts)
+tx4(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts,
+    bool always_rs)
 {
 	uint64_t buf_dma_addr;
 	uint32_t pkt_len;
 	int i;
+	uint32_t flags = DCMD_DTYP_FLAGS;
+
+	if (always_rs)
+		flags |= IXGBE_ADVTXD_DCMD_RS;
 
 	for (i = 0; i < 4; ++i, ++txdp, ++pkts) {
 		buf_dma_addr = RTE_MBUF_DATA_DMA_ADDR(*pkts);
@@ -178,7 +183,7 @@ tx4(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts)
 		txdp->read.buffer_addr = rte_cpu_to_le_64(buf_dma_addr);
 
 		txdp->read.cmd_type_len =
-			rte_cpu_to_le_32((uint32_t)DCMD_DTYP_FLAGS | pkt_len);
+			rte_cpu_to_le_32(flags | pkt_len);
 
 		txdp->read.olinfo_status =
 			rte_cpu_to_le_32(pkt_len << IXGBE_ADVTXD_PAYLEN_SHIFT);
@@ -189,10 +194,15 @@ tx4(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts)
 
 /* Populate 1 descriptor with data from 1 mbuf */
 static inline void
-tx1(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts)
+tx1(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts,
+    bool always_rs)
 {
 	uint64_t buf_dma_addr;
 	uint32_t pkt_len;
+	uint32_t flags = DCMD_DTYP_FLAGS;
+
+	if (always_rs)
+		flags |= IXGBE_ADVTXD_DCMD_RS;
 
 	buf_dma_addr = RTE_MBUF_DATA_DMA_ADDR(*pkts);
 	pkt_len = (*pkts)->data_len;
@@ -200,7 +210,7 @@ tx1(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts)
 	/* write data to descriptor */
 	txdp->read.buffer_addr = rte_cpu_to_le_64(buf_dma_addr);
 	txdp->read.cmd_type_len =
-			rte_cpu_to_le_32((uint32_t)DCMD_DTYP_FLAGS | pkt_len);
+			rte_cpu_to_le_32(flags | pkt_len);
 	txdp->read.olinfo_status =
 			rte_cpu_to_le_32(pkt_len << IXGBE_ADVTXD_PAYLEN_SHIFT);
 	rte_prefetch0(&(*pkts)->pool);
@@ -212,7 +222,7 @@ tx1(volatile union ixgbe_adv_tx_desc *txdp, struct rte_mbuf **pkts)
  */
 static inline void
 ixgbe_tx_fill_hw_ring(struct ixgbe_tx_queue *txq, struct rte_mbuf **pkts,
-		      uint16_t nb_pkts)
+		      uint16_t nb_pkts, bool always_rs)
 {
 	volatile union ixgbe_adv_tx_desc *txdp = &(txq->tx_ring[txq->tx_tail]);
 	struct ixgbe_tx_entry *txep = &(txq->sw_ring[txq->tx_tail]);
@@ -232,20 +242,21 @@ ixgbe_tx_fill_hw_ring(struct ixgbe_tx_queue *txq, struct rte_mbuf **pkts,
 		for (j = 0; j < N_PER_LOOP; ++j) {
 			(txep + i + j)->mbuf = *(pkts + i + j);
 		}
-		tx4(txdp + i, pkts + i);
+		tx4(txdp + i, pkts + i, always_rs);
 	}
 
 	if (unlikely(leftover > 0)) {
 		for (i = 0; i < leftover; ++i) {
 			(txep + mainpart + i)->mbuf = *(pkts + mainpart + i);
-			tx1(txdp + mainpart + i, pkts + mainpart + i);
+			tx1(txdp + mainpart + i, pkts + mainpart + i,
+			    always_rs);
 		}
 	}
 }
 
 static inline uint16_t
 tx_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
-	     uint16_t nb_pkts)
+	     uint16_t nb_pkts, bool always_rs)
 {
 	struct ixgbe_tx_queue *txq = (struct ixgbe_tx_queue *)tx_queue;
 	volatile union ixgbe_adv_tx_desc *tx_r = txq->tx_ring;
@@ -281,22 +292,25 @@ tx_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 	 */
 	if ((txq->tx_tail + nb_pkts) > txq->nb_tx_desc) {
 		n = (uint16_t)(txq->nb_tx_desc - txq->tx_tail);
-		ixgbe_tx_fill_hw_ring(txq, tx_pkts, n);
+		ixgbe_tx_fill_hw_ring(txq, tx_pkts, n, always_rs);
 
-		/*
-		 * We know that the last descriptor in the ring will need to
-		 * have its RS bit set because tx_rs_thresh has to be
-		 * a divisor of the ring size
-		 */
-		tx_r[txq->tx_next_rs].read.cmd_type_len |=
-			rte_cpu_to_le_32(IXGBE_ADVTXD_DCMD_RS);
-		txq->tx_next_rs = (uint16_t)(txq->tx_rs_thresh - 1);
+		if (!always_rs) {
+			/*
+			 * We know that the last descriptor in the ring will
+			 * need to have its RS bit set because tx_rs_thresh has
+			 * to be a divisor of the ring size
+			 */
+			tx_r[txq->tx_next_rs].read.cmd_type_len |=
+				rte_cpu_to_le_32(IXGBE_ADVTXD_DCMD_RS);
+			txq->tx_next_rs = (uint16_t)(txq->tx_rs_thresh - 1);
+		}
 
 		txq->tx_tail = 0;
 	}
 
 	/* Fill H/W descriptor ring with mbuf data */
-	ixgbe_tx_fill_hw_ring(txq, tx_pkts + n, (uint16_t)(nb_pkts - n));
+	ixgbe_tx_fill_hw_ring(txq, tx_pkts + n, (uint16_t)(nb_pkts - n),
+			      always_rs);
 	txq->tx_tail = (uint16_t)(txq->tx_tail + (nb_pkts - n));
 
 	/*
@@ -306,7 +320,7 @@ tx_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 	 * but instead of subtracting 1 and doing >=, we can just do
 	 * greater than without subtracting.
 	 */
-	if (txq->tx_tail > txq->tx_next_rs) {
+	if (!always_rs && txq->tx_tail > txq->tx_next_rs) {
 		tx_r[txq->tx_next_rs].read.cmd_type_len |=
 			rte_cpu_to_le_32(IXGBE_ADVTXD_DCMD_RS);
 		txq->tx_next_rs = (uint16_t)(txq->tx_next_rs +
@@ -329,22 +343,23 @@ tx_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 	return nb_pkts;
 }
 
-uint16_t
-ixgbe_xmit_pkts_simple(void *tx_queue, struct rte_mbuf **tx_pkts,
-		       uint16_t nb_pkts)
+/* if always_rs is TRUE set RS bit on every descriptor with EOP bit */
+static inline uint16_t
+_ixgbe_xmit_pkts_simple(void *tx_queue, struct rte_mbuf **tx_pkts,
+		        uint16_t nb_pkts, bool always_rs)
 {
 	uint16_t nb_tx;
 
 	/* Try to transmit at least chunks of TX_MAX_BURST pkts */
 	if (likely(nb_pkts <= RTE_PMD_IXGBE_TX_MAX_BURST))
-		return tx_xmit_pkts(tx_queue, tx_pkts, nb_pkts);
+		return tx_xmit_pkts(tx_queue, tx_pkts, nb_pkts, always_rs);
 
 	/* transmit more than the max burst, in chunks of TX_MAX_BURST */
 	nb_tx = 0;
 	while (nb_pkts) {
 		uint16_t ret, n;
 		n = (uint16_t)RTE_MIN(nb_pkts, RTE_PMD_IXGBE_TX_MAX_BURST);
-		ret = tx_xmit_pkts(tx_queue, &(tx_pkts[nb_tx]), n);
+		ret = tx_xmit_pkts(tx_queue, &(tx_pkts[nb_tx]), n, always_rs);
 		nb_tx = (uint16_t)(nb_tx + ret);
 		nb_pkts = (uint16_t)(nb_pkts - ret);
 		if (ret < n)
@@ -352,6 +367,20 @@ ixgbe_xmit_pkts_simple(void *tx_queue, struct rte_mbuf **tx_pkts,
 	}
 
 	return nb_tx;
+}
+
+uint16_t
+ixgbe_xmit_pkts_simple(void *tx_queue, struct rte_mbuf **tx_pkts,
+		       uint16_t nb_pkts)
+{
+	return _ixgbe_xmit_pkts_simple(tx_queue, tx_pkts, nb_pkts, false);
+}
+
+uint16_t
+ixgbe_xmit_pkts_simple_always_rs(void *tx_queue, struct rte_mbuf **tx_pkts,
+				 uint16_t nb_pkts)
+{
+	return _ixgbe_xmit_pkts_simple(tx_queue, tx_pkts, nb_pkts, true);
 }
 
 static inline void
@@ -565,9 +594,10 @@ ixgbe_xmit_cleanup(struct ixgbe_tx_queue *txq)
 	return (0);
 }
 
-uint16_t
-ixgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
-		uint16_t nb_pkts)
+/* if always_rs is TRUE set RS bit on every descriptor with EOP bit */
+static inline uint16_t
+_ixgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
+		 uint16_t nb_pkts, bool always_rs)
 {
 	struct ixgbe_tx_queue *txq;
 	struct ixgbe_tx_entry *sw_ring;
@@ -827,11 +857,16 @@ ixgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		 * The last packet data descriptor needs End Of Packet (EOP)
 		 */
 		cmd_type_len |= IXGBE_TXD_CMD_EOP;
-		txq->nb_tx_used = (uint16_t)(txq->nb_tx_used + nb_used);
+
+		if (always_rs)
+			cmd_type_len |= IXGBE_TXD_CMD_RS;
+		else
+			txq->nb_tx_used = (uint16_t)(txq->nb_tx_used + nb_used);
+
 		txq->nb_tx_free = (uint16_t)(txq->nb_tx_free - nb_used);
 
 		/* Set RS bit only on threshold packets' last descriptor */
-		if (txq->nb_tx_used >= txq->tx_rs_thresh) {
+		if (!always_rs && txq->nb_tx_used >= txq->tx_rs_thresh) {
 			PMD_TX_FREE_LOG(DEBUG,
 					"Setting RS bit on TXD id="
 					"%4u (port=%d queue=%d)",
@@ -857,6 +892,20 @@ end_of_tx:
 	txq->tx_tail = tx_id;
 
 	return (nb_tx);
+}
+
+uint16_t
+ixgbe_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
+		uint16_t nb_pkts)
+{
+	return _ixgbe_xmit_pkts(tx_queue, tx_pkts, nb_pkts, false);
+}
+
+uint16_t
+ixgbe_xmit_pkts_always_rs(void *tx_queue, struct rte_mbuf **tx_pkts,
+			  uint16_t nb_pkts)
+{
+	return _ixgbe_xmit_pkts(tx_queue, tx_pkts, nb_pkts, true);
 }
 
 /*********************************************************************
@@ -2047,6 +2096,17 @@ static const struct ixgbe_txq_ops def_txq_ops = {
 void __attribute__((cold))
 ixgbe_set_tx_function(struct rte_eth_dev *dev, struct ixgbe_tx_queue *txq)
 {
+	struct ixgbe_hw *hw = IXGBE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
+
+	/*
+	 * According to 82599 and x540 specifications RS bit *must* be set on
+	 * the last descriptor of *every* packet. Therefore we will not allow
+	 * the tx_rs_thresh above 1 for all NICs newer than 82598. Since VFs are
+	 * available only on devices starting from 82599, tx_rs_thresh should be
+	 * set to 1 for ALL VF devices.
+	 */
+	bool rs_deferring_allowed = (hw->mac.type <= ixgbe_mac_82598EB);
+
 	/* Use a simple Tx queue (no offloads, no multi segs) if possible */
 	if (((txq->txq_flags & IXGBE_SIMPLE_FLAGS) == IXGBE_SIMPLE_FLAGS)
 			&& (txq->tx_rs_thresh >= RTE_PMD_IXGBE_TX_MAX_BURST)) {
@@ -2056,10 +2116,14 @@ ixgbe_set_tx_function(struct rte_eth_dev *dev, struct ixgbe_tx_queue *txq)
 				(rte_eal_process_type() != RTE_PROC_PRIMARY ||
 					ixgbe_txq_vec_setup(txq) == 0)) {
 			PMD_INIT_LOG(DEBUG, "Vector tx enabled.");
-			dev->tx_pkt_burst = ixgbe_xmit_pkts_vec;
+			dev->tx_pkt_burst = (rs_deferring_allowed ?
+					     ixgbe_xmit_pkts_vec :
+					     ixgbe_xmit_pkts_vec_always_rs);
 		} else
 #endif
-		dev->tx_pkt_burst = ixgbe_xmit_pkts_simple;
+		dev->tx_pkt_burst = (rs_deferring_allowed ?
+				     ixgbe_xmit_pkts_simple :
+				     ixgbe_xmit_pkts_simple_always_rs);
 	} else {
 		PMD_INIT_LOG(DEBUG, "Using full-featured tx code path");
 		PMD_INIT_LOG(DEBUG,
@@ -2070,7 +2134,9 @@ ixgbe_set_tx_function(struct rte_eth_dev *dev, struct ixgbe_tx_queue *txq)
 				" - tx_rs_thresh = %lu " "[RTE_PMD_IXGBE_TX_MAX_BURST=%lu]",
 				(unsigned long)txq->tx_rs_thresh,
 				(unsigned long)RTE_PMD_IXGBE_TX_MAX_BURST);
-		dev->tx_pkt_burst = ixgbe_xmit_pkts;
+		dev->tx_pkt_burst = (rs_deferring_allowed ?
+				     ixgbe_xmit_pkts :
+				     ixgbe_xmit_pkts_always_rs);
 	}
 }
 

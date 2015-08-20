@@ -723,9 +723,10 @@ tx_backlog_entry(struct ixgbe_tx_entry_v *txep,
 		txep[i].mbuf = tx_pkts[i];
 }
 
-uint16_t
-ixgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
-		       uint16_t nb_pkts)
+/* if always_rs is TRUE set RS bit on every descriptor with EOP bit */
+static inline uint16_t
+_ixgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
+		     uint16_t nb_pkts, bool always_rs)
 {
 	struct ixgbe_tx_queue *txq = (struct ixgbe_tx_queue *)tx_queue;
 	volatile union ixgbe_adv_tx_desc *txdp;
@@ -734,6 +735,9 @@ ixgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
 	uint64_t flags = DCMD_DTYP_FLAGS;
 	uint64_t rs = IXGBE_ADVTXD_DCMD_RS|DCMD_DTYP_FLAGS;
 	int i;
+
+	if (always_rs)
+		flags = rs;
 
 	if (unlikely(nb_pkts > RTE_IXGBE_VPMD_TX_BURST))
 		nb_pkts = RTE_IXGBE_VPMD_TX_BURST;
@@ -764,7 +768,8 @@ ixgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
 		nb_commit = (uint16_t)(nb_commit - n);
 
 		tx_id = 0;
-		txq->tx_next_rs = (uint16_t)(txq->tx_rs_thresh - 1);
+		if (!always_rs)
+			txq->tx_next_rs = (uint16_t)(txq->tx_rs_thresh - 1);
 
 		/* avoid reach the end of ring */
 		txdp = &(txq->tx_ring[tx_id]);
@@ -776,7 +781,7 @@ ixgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
 	vtx(txdp, tx_pkts, nb_commit, flags);
 
 	tx_id = (uint16_t)(tx_id + nb_commit);
-	if (tx_id > txq->tx_next_rs) {
+	if (!always_rs && tx_id > txq->tx_next_rs) {
 		txq->tx_ring[txq->tx_next_rs].read.cmd_type_len |=
 			rte_cpu_to_le_32(IXGBE_ADVTXD_DCMD_RS);
 		txq->tx_next_rs = (uint16_t)(txq->tx_next_rs +
@@ -788,6 +793,18 @@ ixgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
 	IXGBE_PCI_REG_WRITE(txq->tdt_reg_addr, txq->tx_tail);
 
 	return nb_pkts;
+}
+
+uint16_t
+ixgbe_xmit_pkts_vec(void *tx_queue, struct rte_mbuf **tx_pkts,
+		     uint16_t nb_pkts) {
+	return _ixgbe_xmit_pkts_vec(tx_queue, tx_pkts, nb_pkts, false);
+}
+
+uint16_t
+ixgbe_xmit_pkts_vec_always_rs(void *tx_queue, struct rte_mbuf **tx_pkts,
+		     uint16_t nb_pkts) {
+	return _ixgbe_xmit_pkts_vec(tx_queue, tx_pkts, nb_pkts, true);
 }
 
 static void __attribute__((cold))
