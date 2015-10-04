@@ -45,6 +45,7 @@
 #include <sys/signalfd.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
+#include <linux/uio_pci_generic.h>
 
 #include <rte_common.h>
 #include <rte_interrupts.h>
@@ -91,9 +92,7 @@ union intr_pipefds{
  */
 union rte_intr_read_buffer {
 	int uio_intr_count;              /* for uio device */
-#ifdef VFIO_PRESENT
-	uint64_t vfio_intr_count;        /* for vfio device */
-#endif
+	uint64_t eventfd_count;		 /* for vfio and uio_pci_generic in MSI-X mode */
 	uint64_t timerfd_num;            /* for timerfd */
 	char charbuf[16];                /* for others */
 };
@@ -348,6 +347,79 @@ vfio_disable_msix(struct rte_intr_handle *intr_handle) {
 }
 #endif
 
+/* enable MSI-X interrupts */
+static int
+uio_msix_enable(struct rte_intr_handle *intr_handle)
+{
+	int i, max_intr;
+	uint32_t irq_num;
+
+	/* Get the maximal IRQ number */
+	if (ioctl(intr_handle->fd, UIO_PCI_GENERIC_IRQ_NUM_GET, &irq_num) < 0) {
+		RTE_LOG(ERR, EAL,
+			"Error getting number of IRQs (%s)\n",
+			strerror(errno));
+		return -1;
+	}
+
+	intr_handle->max_intr = irq_num;
+
+	if (!intr_handle->max_intr ||
+	    intr_handle->max_intr > RTE_MAX_RXTX_INTR_VEC_ID)
+		max_intr = RTE_MAX_RXTX_INTR_VEC_ID + 1;
+	else
+		max_intr = intr_handle->max_intr;
+
+	/* Actual number of MSI-X interrupts might be less than requested */
+	for (i = 0; i < max_intr; i++) {
+		struct uio_pci_generic_irq_set irqs = {
+			.vec = i,
+			.fd = intr_handle->efds[i],
+		};
+
+		if (i == max_intr - 1)
+			irqs.fd = intr_handle->fd;
+
+		if (ioctl(intr_handle->fd, UIO_PCI_GENERIC_IRQ_SET, &irqs) < 0) {
+			RTE_LOG(ERR, EAL,
+				"Error enabling MSI-X event %u fd %d (%s)\n",
+				irqs.vec, irqs.fd, strerror(errno));
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/* disable MSI-X interrupts */
+static int
+uio_msix_disable(struct rte_intr_handle *intr_handle)
+{
+	int i, max_intr;
+
+	if (!intr_handle->max_intr ||
+	    intr_handle->max_intr > RTE_MAX_RXTX_INTR_VEC_ID)
+		max_intr = RTE_MAX_RXTX_INTR_VEC_ID + 1;
+	else
+		max_intr = intr_handle->max_intr;
+
+	for (i = 0; i < max_intr; i++) {
+		struct uio_pci_generic_irq_set irqs = {
+			.vec = i,
+			.fd = -1,
+		};
+
+		if (ioctl(intr_handle->vfio_dev_fd, UIO_PCI_GENERIC_IRQ_SET, &irqs) < 0) {
+			RTE_LOG(ERR, EAL,
+				"Error disabling MSI-X event %u (%s)\n",
+				i, strerror(errno));
+			return -1;
+		}
+	}
+	return 0;
+}
+
+
 static int
 uio_intx_intr_disable(struct rte_intr_handle *intr_handle)
 {
@@ -576,6 +648,10 @@ rte_intr_enable(struct rte_intr_handle *intr_handle)
 		if (uio_intx_intr_enable(intr_handle))
 			return -1;
 		break;
+	case RTE_INTR_HANDLE_UIO_MSIX:
+		if (uio_msix_enable(intr_handle))
+			return -1;
+		break;
 	/* not used at this moment */
 	case RTE_INTR_HANDLE_ALARM:
 		return -1;
@@ -618,6 +694,10 @@ rte_intr_disable(struct rte_intr_handle *intr_handle)
 		break;
 	case RTE_INTR_HANDLE_UIO_INTX:
 		if (uio_intx_intr_disable(intr_handle))
+			return -1;
+		break;
+	case RTE_INTR_HANDLE_UIO_MSIX:
+		if (uio_msix_disable(intr_handle))
 			return -1;
 		break;
 	/* not used at this moment */
@@ -692,13 +772,15 @@ eal_intr_process_interrupts(struct epoll_event *events, int nfds)
 		case RTE_INTR_HANDLE_ALARM:
 			bytes_read = sizeof(buf.timerfd_num);
 			break;
-#ifdef VFIO_PRESENT
+		case RTE_INTR_HANDLE_UIO_MSIX:
+#ifdef RTE_EAL_VFIO
 		case RTE_INTR_HANDLE_VFIO_MSIX:
 		case RTE_INTR_HANDLE_VFIO_MSI:
 		case RTE_INTR_HANDLE_VFIO_LEGACY:
-			bytes_read = sizeof(buf.vfio_intr_count);
-			break;
+
 #endif
+			bytes_read = sizeof(buf.eventfd_count);
+			break;
 		default:
 			bytes_read = 1;
 			break;
@@ -902,7 +984,7 @@ eal_intr_proc_rxtx_intr(int fd, const struct rte_intr_handle *intr_handle)
 	case RTE_INTR_HANDLE_VFIO_MSIX:
 	case RTE_INTR_HANDLE_VFIO_MSI:
 	case RTE_INTR_HANDLE_VFIO_LEGACY:
-		bytes_read = sizeof(buf.vfio_intr_count);
+		bytes_read = sizeof(buf.eventfd_count);
 		break;
 #endif
 	default:

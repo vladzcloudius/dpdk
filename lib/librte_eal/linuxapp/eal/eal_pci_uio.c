@@ -38,6 +38,9 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <linux/pci_regs.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <linux/uio_pci_generic.h>
 
 #include <rte_log.h>
 #include <rte_pci.h>
@@ -232,6 +235,36 @@ pci_uio_free_resource(struct rte_pci_device *dev,
 	}
 }
 
+static int
+pci_uio_msix_init(struct rte_pci_device *dev)
+{
+	int i, fd;
+
+	/* set up an eventfd for interrupts */
+	fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (fd < 0) {
+		RTE_LOG(ERR, EAL, "  cannot set up irq eventfd (%s)\n",
+			strerror(errno));
+		return -1;
+	}
+	dev->intr_handle.fd = fd;
+
+	/* an additional eventfd for each vector */
+	for (i = 0; i < RTE_MAX_RXTX_INTR_VEC_ID; i++) {
+		fd = eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC);
+		if (fd < 0) {
+			RTE_LOG(ERR, EAL,
+				" cannot set up eventfd (%s)\n",
+				strerror(errno));
+			return -1;
+		}
+
+		dev->intr_handle.efds[i] = fd;
+	}
+
+	return 0;
+}
+
 int
 pci_uio_alloc_resource(struct rte_pci_device *dev,
 		struct mapped_pci_resource **uio_res)
@@ -239,10 +272,13 @@ pci_uio_alloc_resource(struct rte_pci_device *dev,
 	char dirname[PATH_MAX];
 	char cfgname[PATH_MAX];
 	char devname[PATH_MAX]; /* contains the /dev/uioX */
-	int uio_num;
+	int uio_num, i;
 	struct rte_pci_addr *loc;
 
 	loc = &dev->addr;
+
+	for (i = 0; i < RTE_MAX_RXTX_INTR_VEC_ID; i++)
+		dev->intr_handle.efds[i] = -1;
 
 	/* find uio resource */
 	uio_num = pci_get_uio_dev(dev, dirname, sizeof(dirname));
@@ -272,13 +308,32 @@ pci_uio_alloc_resource(struct rte_pci_device *dev,
 
 	if (dev->kdrv == RTE_KDRV_IGB_UIO)
 		dev->intr_handle.type = RTE_INTR_HANDLE_UIO;
-	else {
-		dev->intr_handle.type = RTE_INTR_HANDLE_UIO_INTX;
-
-		/* set bus master that is not done by uio_pci_generic */
-		if (pci_uio_set_bus_master(dev->intr_handle.uio_cfg_fd)) {
-			RTE_LOG(ERR, EAL, "Cannot set up bus mastering!\n");
+	else { /* UIO_PCI_GENERIC */
+		uint32_t int_mode;
+		/* check the interrupt mode we run in */
+		if (ioctl(dev->intr_handle.fd, UIO_PCI_GENERIC_INT_MODE_GET, &int_mode) < 0) {
+			RTE_LOG(ERR, EAL,
+				"Error getting interrupt mode (%s)\n",
+				strerror(errno));
 			goto error;
+		}
+
+		if (int_mode != UIO_INT_MODE_MSIX) {
+			/* MSI handling is the same as INTX */
+			dev->intr_handle.type = RTE_INTR_HANDLE_UIO_INTX;
+
+			/* set bus master that is not done by uio_pci_generic
+			 * when interrupt mode is INTX
+			 */
+			if (int_mode == UIO_INT_MODE_INTX &&
+			    pci_uio_set_bus_master(dev->intr_handle.uio_cfg_fd)) {
+				RTE_LOG(ERR, EAL, "Cannot set up bus mastering!\n");
+				goto error;
+			}
+		} else {
+			dev->intr_handle.type = RTE_INTR_HANDLE_UIO_MSIX;
+			if (pci_uio_msix_init(dev) < 0)
+				goto error;
 		}
 	}
 
