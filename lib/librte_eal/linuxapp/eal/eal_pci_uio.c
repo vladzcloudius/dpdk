@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <linux/pci_regs.h>
+#include <sys/eventfd.h>
 
 #include <rte_log.h>
 #include <rte_pci.h>
@@ -259,13 +260,42 @@ pci_get_uio_dev(struct rte_pci_device *dev, char *dstbuf,
 	return uio_num;
 }
 
+static int
+pci_uio_msix_init(struct rte_pci_device *dev)
+{
+	int i, fd;
+
+	/* set up an eventfd for interrupts */
+	fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (fd < 0) {
+		RTE_LOG(ERR, EAL, "  cannot set up irq eventfd (%s)\n",
+			strerror(errno));
+		return -1;
+	}
+	dev->intr_handle.fd = fd;
+
+	/* an additional eventfd for each vector */
+	for (i = 0; i < RTE_MAX_RXTX_INTR_VEC_ID; i++) {
+		fd = eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC);
+		if (fd < 0) {
+			RTE_LOG(ERR, EAL,
+				" cannot set up eventfd (%s)\n",
+				strerror(errno));
+			return -1;
+		}
+
+		dev->intr_handle.efds[i] = fd;
+	}
+
+	return 0;
+}
+
 /* map the PCI resource of a PCI device in virtual memory */
 int
 pci_uio_map_resource(struct rte_pci_device *dev)
 {
-	int i, map_idx;
+	int i, fd, map_idx;
 	char dirname[PATH_MAX];
-	char cfgname[PATH_MAX];
 	char devname[PATH_MAX]; /* contains the /dev/uioX */
 	void *mapaddr;
 	int uio_num;
@@ -274,10 +304,14 @@ pci_uio_map_resource(struct rte_pci_device *dev)
 	struct mapped_pci_resource *uio_res;
 	struct mapped_pci_res_list *uio_res_list = RTE_TAILQ_CAST(rte_uio_tailq.head, mapped_pci_res_list);
 	struct pci_map *maps;
+	char cfgname[PATH_MAX];
 
 	dev->intr_handle.fd = -1;
-	dev->intr_handle.uio_cfg_fd = -1;
+	dev->intr_handle.vfio_dev_fd = -1;
 	dev->intr_handle.type = RTE_INTR_HANDLE_UNKNOWN;
+
+	for (i = 0; i < RTE_MAX_RXTX_INTR_VEC_ID; i++)
+		dev->intr_handle.efds[i] = -1;
 
 	/* secondary processes - use already recorded details */
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
@@ -293,15 +327,15 @@ pci_uio_map_resource(struct rte_pci_device *dev)
 	snprintf(devname, sizeof(devname), "/dev/uio%u", uio_num);
 
 	/* save fd if in primary process */
-	dev->intr_handle.fd = open(devname, O_RDWR);
-	if (dev->intr_handle.fd < 0) {
+	fd = open(devname, O_RDWR);
+	if (fd < 0) {
 		RTE_LOG(ERR, EAL, "Cannot open %s: %s\n",
 			devname, strerror(errno));
 		return -1;
 	}
 
 	snprintf(cfgname, sizeof(cfgname),
-			"/sys/class/uio/uio%u/device/config", uio_num);
+		 "/sys/class/uio/uio%u/device/config", uio_num);
 	dev->intr_handle.uio_cfg_fd = open(cfgname, O_RDWR);
 	if (dev->intr_handle.uio_cfg_fd < 0) {
 		RTE_LOG(ERR, EAL, "Cannot open %s: %s\n",
@@ -309,15 +343,33 @@ pci_uio_map_resource(struct rte_pci_device *dev)
 		return -1;
 	}
 
-	if (dev->kdrv == RTE_KDRV_IGB_UIO)
+	if (dev->kdrv == RTE_KDRV_IGB_UIO) {
+		dev->intr_handle.fd = fd;
 		dev->intr_handle.type = RTE_INTR_HANDLE_UIO;
-	else {
-		dev->intr_handle.type = RTE_INTR_HANDLE_UIO_INTX;
-
-		/* set bus master that is not done by uio_pci_generic */
-		if (pci_uio_set_bus_master(dev->intr_handle.uio_cfg_fd)) {
-			RTE_LOG(ERR, EAL, "Cannot set up bus mastering!\n");
+	} else { /* UIO_PCI_GENERIC */
+		uint32_t int_mode;
+		/* check the interrupt mode we run in */
+		if (ioctl(fd, UIO_INT_MODE_MSIX, &int_mode) < 0) {
+			RTE_LOG(ERR, EAL,
+				"Error getting interrupt mode (%s)\n",
+				strerror(errno));
 			return -1;
+		}
+
+		if (int_mode != UIO_INT_MODE_MSIX) {
+			dev->intr_handle.fd = fd;
+			dev->intr_handle.type = RTE_INTR_HANDLE_UIO_INTX;
+
+			/* set bus master that is not done by uio_pci_generic */
+			if (pci_uio_set_bus_master(dev->intr_handle.uio_cfg_fd)) {
+				RTE_LOG(ERR, EAL, "Cannot set up bus mastering!\n");
+				return -1;
+			}
+		} else {
+			dev->intr_handle.vfio_dev_fd = fd;
+			dev->intr_handle.type = RTE_INTR_HANDLE_UIO_MSIX;
+			if (pci_uio_msix_init(dev) < 0)
+				return -1;
 		}
 	}
 
@@ -460,6 +512,7 @@ pci_uio_unmap_resource(struct rte_pci_device *dev)
 
 	/* close fd if in primary process */
 	close(dev->intr_handle.fd);
+	close(dev->intr_handle.uio_cfg_fd);
 
 	dev->intr_handle.fd = -1;
 	dev->intr_handle.type = RTE_INTR_HANDLE_UNKNOWN;

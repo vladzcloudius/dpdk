@@ -42,6 +42,7 @@ enum rte_intr_handle_type {
 	RTE_INTR_HANDLE_UNKNOWN = 0,
 	RTE_INTR_HANDLE_UIO,          /**< uio device handle */
 	RTE_INTR_HANDLE_UIO_INTX,     /**< uio generic handle */
+	RTE_INTR_HANDLE_UIO_MSIX,     /**< uio with MSI-X support */
 	RTE_INTR_HANDLE_VFIO_LEGACY,  /**< vfio device handle (legacy) */
 	RTE_INTR_HANDLE_VFIO_MSI,     /**< vfio device handle (MSI) */
 	RTE_INTR_HANDLE_VFIO_MSIX,    /**< vfio device handle (MSIX) */
