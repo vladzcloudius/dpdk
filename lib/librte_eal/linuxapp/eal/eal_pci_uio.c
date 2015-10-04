@@ -38,7 +38,9 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <linux/pci_regs.h>
+#include <linux/uio_pci_generic.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 
 #include <rte_log.h>
 #include <rte_pci.h>
