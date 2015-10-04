@@ -50,6 +50,7 @@ enum rte_intr_handle_type {
 	RTE_INTR_HANDLE_MAX
 };
 
+#define RTE_MAX_RXTX_INTR_VEC_ID 32
 /** Handle for interrupts. */
 struct rte_intr_handle {
 	union {
@@ -58,6 +59,8 @@ struct rte_intr_handle {
 					for uio_pci_generic */
 	};
 	int fd;	 /**< interrupt event file descriptor */
+	int efds[RTE_MAX_RXTX_INTR_VEC_ID + 1];
+	int max_intr;
 	enum rte_intr_handle_type type;  /**< handle type */
 };
 

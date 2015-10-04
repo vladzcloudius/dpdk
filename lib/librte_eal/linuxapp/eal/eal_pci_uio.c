@@ -264,6 +264,17 @@ static int
 pci_uio_msix_init(struct rte_pci_device *dev)
 {
 	int i, fd;
+	uint32_t irq_num;
+
+	/* Get the maximal IRQ number */
+	if (ioctl(dev->intr_handle.vfio_dev_fd, UIO_PCI_GENERIC_IRQ_NUM_GET, &irq_num) < 0) {
+		RTE_LOG(ERR, EAL,
+			"Error getting number of IRQs (%s)\n",
+			strerror(errno));
+		return -1;
+	}
+
+	dev->intr_handle.max_intr = irq_num;
 
 	/* set up an eventfd for interrupts */
 	fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -308,6 +319,7 @@ pci_uio_map_resource(struct rte_pci_device *dev)
 
 	dev->intr_handle.fd = -1;
 	dev->intr_handle.vfio_dev_fd = -1;
+	dev->intr_handle.max_intr = 0;
 	dev->intr_handle.type = RTE_INTR_HANDLE_UNKNOWN;
 
 	for (i = 0; i < RTE_MAX_RXTX_INTR_VEC_ID; i++)
@@ -349,7 +361,7 @@ pci_uio_map_resource(struct rte_pci_device *dev)
 	} else { /* UIO_PCI_GENERIC */
 		uint32_t int_mode;
 		/* check the interrupt mode we run in */
-		if (ioctl(fd, UIO_INT_MODE_MSIX, &int_mode) < 0) {
+		if (ioctl(fd, UIO_PCI_GENERIC_INT_MODE_GET, &int_mode) < 0) {
 			RTE_LOG(ERR, EAL,
 				"Error getting interrupt mode (%s)\n",
 				strerror(errno));
