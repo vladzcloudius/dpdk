@@ -107,6 +107,7 @@ pci_uio_map_resource(struct rte_pci_device *dev)
 
 	dev->intr_handle.fd = -1;
 	dev->intr_handle.uio_cfg_fd = -1;
+	dev->intr_handle.vfio_dev_fd = -1;
 	dev->intr_handle.type = RTE_INTR_HANDLE_UNKNOWN;
 
 	/* secondary processes - use already recorded details */

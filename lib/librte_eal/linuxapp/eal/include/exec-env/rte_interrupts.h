@@ -80,11 +80,9 @@ struct rte_epoll_event {
 
 /** Handle for interrupts. */
 struct rte_intr_handle {
-	union {
-		int vfio_dev_fd;  /**< VFIO device file descriptor */
-		int uio_cfg_fd;  /**< UIO config file descriptor
-					for uio_pci_generic */
-	};
+	// TODO: rename
+	int vfio_dev_fd;  /**< VFIO and UIO device file descriptor */
+	int uio_cfg_fd;  /**< UIO config file descriptor for uio_pci_generic */
 	int fd;	 /**< interrupt event file descriptor */
 	enum rte_intr_handle_type type;  /**< handle type */
 #ifdef RTE_NEXT_ABI

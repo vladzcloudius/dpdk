@@ -332,6 +332,10 @@ pci_uio_alloc_resource(struct rte_pci_device *dev,
 			}
 		} else {
 			dev->intr_handle.type = RTE_INTR_HANDLE_UIO_MSIX;
+
+			/* We are going to ovewrite the "fd" with eventfd */
+			dev->intr_handle.vfio_dev_fd = dev->intr_handle.fd;
+
 			if (pci_uio_msix_init(dev) < 0)
 				goto error;
 		}

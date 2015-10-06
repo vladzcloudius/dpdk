@@ -355,7 +355,7 @@ uio_msix_enable(struct rte_intr_handle *intr_handle)
 	uint32_t irq_num;
 
 	/* Get the maximal IRQ number */
-	if (ioctl(intr_handle->fd, UIO_PCI_GENERIC_IRQ_NUM_GET, &irq_num) < 0) {
+	if (ioctl(intr_handle->vfio_dev_fd, UIO_PCI_GENERIC_IRQ_NUM_GET, &irq_num) < 0) {
 		RTE_LOG(ERR, EAL,
 			"Error getting number of IRQs (%s)\n",
 			strerror(errno));
@@ -380,7 +380,7 @@ uio_msix_enable(struct rte_intr_handle *intr_handle)
 		if (i == max_intr - 1)
 			irqs.fd = intr_handle->fd;
 
-		if (ioctl(intr_handle->fd, UIO_PCI_GENERIC_IRQ_SET, &irqs) < 0) {
+		if (ioctl(intr_handle->vfio_dev_fd, UIO_PCI_GENERIC_IRQ_SET, &irqs) < 0) {
 			RTE_LOG(ERR, EAL,
 				"Error enabling MSI-X event %u fd %d (%s)\n",
 				irqs.vec, irqs.fd, strerror(errno));
@@ -763,7 +763,7 @@ eal_intr_process_interrupts(struct epoll_event *events, int nfds)
 		src->active = 1;
 		rte_spinlock_unlock(&intr_lock);
 
-		/* set the length to be read dor different handle type */
+		/* set the length to be read for different handle type */
 		switch (src->intr_handle.type) {
 		case RTE_INTR_HANDLE_UIO:
 		case RTE_INTR_HANDLE_UIO_INTX:
@@ -1216,7 +1216,8 @@ rte_intr_efd_enable(struct rte_intr_handle *intr_handle, uint32_t nb_efd)
 	int fd;
 	uint32_t n = RTE_MIN(nb_efd, (uint32_t)RTE_MAX_RXTX_INTR_VEC_ID);
 
-	if (intr_handle->type == RTE_INTR_HANDLE_VFIO_MSIX) {
+	if (intr_handle->type == RTE_INTR_HANDLE_VFIO_MSIX ||
+	    intr_handle->type == RTE_INTR_HANDLE_UIO_MSIX) {
 		for (i = 0; i < n; i++) {
 			fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 			if (fd < 0) {
