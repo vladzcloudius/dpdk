@@ -365,7 +365,7 @@ uio_msix_enable(struct rte_intr_handle *intr_handle)
 	intr_handle->max_intr = irq_num;
 
 	if (!intr_handle->max_intr ||
-	    intr_handle->max_intr > RTE_MAX_RXTX_INTR_VEC_ID)
+	    intr_handle->max_intr > RTE_MAX_RXTX_INTR_VEC_ID + 1)
 		max_intr = RTE_MAX_RXTX_INTR_VEC_ID + 1;
 	else
 		max_intr = intr_handle->max_intr;
@@ -398,7 +398,7 @@ uio_msix_disable(struct rte_intr_handle *intr_handle)
 	int i, max_intr;
 
 	if (!intr_handle->max_intr ||
-	    intr_handle->max_intr > RTE_MAX_RXTX_INTR_VEC_ID)
+	    intr_handle->max_intr > RTE_MAX_RXTX_INTR_VEC_ID + 1)
 		max_intr = RTE_MAX_RXTX_INTR_VEC_ID + 1;
 	else
 		max_intr = intr_handle->max_intr;
